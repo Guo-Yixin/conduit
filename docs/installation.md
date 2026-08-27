@@ -7,7 +7,7 @@ running the container, and verifying the environment with `conduit doctor`.
 
 ## Table of Contents
 
-1. [Build the engine image](#1-build-the-engine-image)
+1. [Get the engine image](#1-get-the-engine-image)
 2. [Build a per-flow image](#2-build-a-per-flow-image)
 3. [Run a single-container engine](#3-run-a-single-container-engine)
 4. [Run the dev stack (compose)](#4-run-the-dev-stack-compose)
@@ -18,7 +18,23 @@ running the container, and verifying the environment with `conduit doctor`.
 
 ---
 
-## 1. Build the engine image
+## 1. Get the engine image
+
+The supported release image is published to GitHub Container Registry for
+Linux on both amd64 and arm64. Pin the immutable version in deployments, then
+optionally add the local name used by the Compose examples:
+
+```bash
+docker pull ghcr.io/theaiteam-dev/conduit-engine:1.0.0
+docker tag ghcr.io/theaiteam-dev/conduit-engine:1.0.0 conduit-engine:1.0.0
+docker tag ghcr.io/theaiteam-dev/conduit-engine:1.0.0 conduit-engine:latest
+```
+
+`ghcr.io/theaiteam-dev/conduit-engine:latest` tracks the newest stable release.
+Use `:1.0.0` when reproducibility matters and `:main` only to test unreleased
+changes.
+
+### Build from source
 
 The engine image is defined by the `Dockerfile` at the repository root. It pins
 Bun to `oven/bun:1.3.11-slim`, creates a non-root system user (`conduit`), and
@@ -30,7 +46,7 @@ forwarded verbatim as a `conduit` subcommand.
 docker build -t conduit-engine .
 ```
 
-To pin a release version:
+To tag a source build with the release version:
 
 ```bash
 docker build -t conduit-engine:1.0.0 .

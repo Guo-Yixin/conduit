@@ -13,8 +13,6 @@ on:
       - ".github/workflows/docker.yml"
   push:
     branches: [main]
-    tags:
-      - "v*.*.*"
   workflow_dispatch:
 
 permissions:
@@ -55,8 +53,6 @@ jobs:
           tags: |
             type=raw,value=main,enable={{is_default_branch}}
             type=sha,prefix=sha-
-            type=semver,pattern={{version}}
-            type=semver,pattern={{major}}.{{minor}}
 
       - name: Build image
         uses: docker/build-push-action@v6

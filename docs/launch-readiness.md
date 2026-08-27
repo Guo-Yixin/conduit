@@ -1,7 +1,7 @@
 # Public Repository Launch Readiness
 
 - **Status:** In progress
-- **Updated:** 2026-08-25
+- **Updated:** 2026-08-27
 - **Repository:** [theaiteam-dev/conduit](https://github.com/theaiteam-dev/conduit)
 
 This checklist is the launch gate for Conduit's fresh public repository. It
@@ -21,7 +21,7 @@ safe for outside contributors. Product sequencing lives in
   `https://github.com/theaiteam-dev/conduit`.
 - [x] Check committed content for credentials, private repository coordinates,
   personal filesystem paths, and customer names.
-- [ ] Create the initial commit, attach the public remote, and verify the default
+- [x] Create the initial commit, attach the public remote, and verify the default
   branch is `main`.
 
 ## Developer-preview documentation
@@ -35,14 +35,14 @@ safe for outside contributors. Product sequencing lives in
 - [x] Validate local Markdown file links and section anchors.
 - [x] Add a short README quickstart that a developer can run from a clean
   checkout without first reading the full deployment guide.
-- [ ] Run the documented quickstart on a clean machine and record the exact
+- [x] Run the documented quickstart on a clean machine and record the exact
   supported Bun and Docker prerequisites.
 - [x] Publish a concise comparison explaining when to use Conduit instead of a
   durable workflow engine or a general automation framework.
 
 ## Launch operations
 
-- [ ] Verify tests and typechecking pass in the public GitHub Actions context.
+- [x] Verify tests and typechecking pass in the public GitHub Actions context.
 - [ ] Confirm issue and pull-request templates contain no private workflow
   assumptions.
 - [ ] Publish the first public version tag and release notes.
