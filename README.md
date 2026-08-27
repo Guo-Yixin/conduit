@@ -110,6 +110,27 @@ For the topology and a measured parallelism demonstration, see the
 [concurrency write-up](./docs/concurrency-demo.md). For model-backed and Docker
 deployment paths, continue with the [installation guide](./docs/installation.md).
 
+## Docker Image Channels
+
+Conduit publishes `ghcr.io/theaiteam-dev/conduit-engine` with two distinct
+meanings:
+
+| Tag | Meaning |
+|---|---|
+| `main` | Rolling image from the newest commit on the default branch; it may contain unreleased changes. |
+| `sha-<commit>` | Immutable image for a specific commit on `main`. |
+| `latest` | Newest stable release. |
+| `1`, `1.0`, `1.0.0` | Stable release aliases at major, minor, and exact-version precision. Pin the exact version for reproducible deployments. |
+
+Release-worthy conventional commits on `main` are verified and processed by
+semantic-release. That workflow creates the Git tag and GitHub Release, then
+publishes the version aliases and advances `latest`. Manually pushing a Git tag
+does not publish a container image.
+
+```bash
+docker pull ghcr.io/theaiteam-dev/conduit-engine:1.0.0
+```
+
 ## What You Can Build
 
 Conduit is for workflows where AI creates or evaluates artifacts and mistakes
