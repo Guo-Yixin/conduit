@@ -1,0 +1,68 @@
+# Invalid fixture: hold-timeout-without-on-timeout (WI-291)
+#
+# Defect: the slack egress channel declares hold_timeout_seconds: 30 but
+# omits the required on_timeout field.
+#
+# Per SPEC §4A: "on_timeout is required in config whenever hold_timeout
+# is set — the kernel rejects the config at load otherwise."
+#
+# Result: the validator must reject this config at load with a
+# "hold_timeout requires on_timeout" error before any run is started.
+#
+# This file is syntactically valid YAML; the error is semantic.
+
+flow: hold-timeout-no-action-example
+project_root: ./workspace
+flow_version: 1
+
+budgets:
+  run:
+    wall_clock_minutes: 10
+    max_tokens: 100000
+  per_card:
+    max_execution_attempts: 3
+  liveness:
+    no_progress_minutes: 5
+
+defaults:
+  cap_policy: scrap
+  on_dep_scrap: hold
+
+terminal_lanes: [done, scrap, hold]
+
+stations:
+  - id: write
+    worker:
+      kind: transform
+      role: writer
+      model: gpt-4o-mini
+    wip: 5
+    inputs: [request.json]
+    outputs: [draft.md]
+    check:
+      kind: rank
+      class: taste
+      critic:
+        role: selector
+        model: gpt-4o-mini
+      on_reject: write
+      rework_cap: 2
+      progress_signal: findings_hash
+
+  - id: publish
+    worker:
+      kind: deterministic
+      role: publisher
+    wip: 3
+    inputs: [draft.md]
+    outputs: [final.md]
+
+channels:
+  ingress:
+    type: cli
+  egress:
+    - type: slack
+      target: "#content"
+      uses: [status, hitl, alerts, delivery]
+      hold_timeout_seconds: 30  # hold_timeout set …
+      # on_timeout is intentionally absent — this makes the config invalid

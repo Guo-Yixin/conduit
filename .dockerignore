@@ -1,0 +1,33 @@
+# Dependencies and build output — rebuilt inside the container
+node_modules
+dist
+build
+.next
+
+# Version-control and local agent metadata — not needed in the image
+.git
+.github
+.claude
+devtrack.yaml
+project.yaml
+
+# Runtime secrets — injected only via -e / docker secret at runtime (FR-5)
+# Keep the documented placeholder file, but never include local variants or npm credentials.
+.env
+.env.*
+!.env.example
+.npmrc
+
+# Local SQLite state files — mounted at runtime on a volume, never baked in
+*.db
+*.db-journal
+*.db-shm
+*.db-wal
+*.sqlite
+*.sqlite-journal
+*.sqlite-shm
+*.sqlite-wal
+
+# Editor and operating-system noise
+.DS_Store
+*.swp

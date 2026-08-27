@@ -1,0 +1,7 @@
+{
+  "packageManager": "bun",
+  "checks": {},
+  "precheck": [],
+  "postcheck": [],
+  "ateamCliVersion": "latest"
+}

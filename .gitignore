@@ -1,0 +1,43 @@
+# dependencies
+node_modules/
+
+# secrets & local env (the Slack tokens live here — never commit)
+.env
+.env.*
+!.env.example
+
+# runtime state / databases (the Journal of Truth is local)
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+conduit.sqlite*
+conduit.*.sqlite*
+
+# example flow runtime artifacts (request.json seeded from request.example.json)
+examples/**/context.json
+examples/**/idea.json
+examples/**/request.json
+examples/**/selected.json
+examples/**/plan.json
+examples/**/flow-demo.yaml
+
+# build output
+dist/
+build/
+
+# OS / editor
+.DS_Store
+*.swp
+
+# local Claude Code settings and scheduler state
+.claude/settings.local.json
+.claude/scheduled_tasks.lock
+
+# local agent worktrees and project-management state
+.claude/worktrees/
+devtrack.yaml
+project.yaml
+
+# local package-manager credentials
+.npmrc

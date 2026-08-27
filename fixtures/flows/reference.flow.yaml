@@ -1,0 +1,137 @@
+# Reference flow fixture (WI-291)
+#
+# Synthetic content-pipeline that exercises every kernel branch:
+#   - fan-out: plan fans out 1 parent into exactly 3 child cards
+#   - gate check: plan has a gate critic; on_reject back-edge returns to
+#     plan (itself — the first work station)
+#   - rank check + HITL: select has a rank critic; scores the 3 publish
+#     outputs and routes to hold for human selection via the slack channel
+#   - effectful station: publish (last work station before fan-in)
+#   - fan-in quorum(2): assemble requires at least 2 of 3 children
+#   - scrap-at-cap path: defaults.cap_policy: scrap + per_card.max_execution_attempts
+#   - hold-timeout path: slack egress hold_timeout_seconds + on_timeout: scrap
+#
+# Prompts and artifact shapes are trivial stand-ins; the goal is branch
+# coverage of the engine, not realistic content generation.
+
+flow: content-pipeline
+project_root: ./workspace
+flow_version: 1
+
+# ── Budgets ────────────────────────────────────────────────────────────────
+budgets:
+  run:                          # consumption andon (SPEC §8)
+    wall_clock_minutes: 60
+    max_tokens: 1000000
+  per_wave:                     # subtree andon keyed by parent_id
+    max_tokens: 200000
+    max_dispatches: 50
+  per_card:
+    max_execution_attempts: 4   # scrap after 4 failed attempts (scrap-at-cap)
+  liveness:
+    no_progress_minutes: 5      # deadlock watchdog (SPEC §8)
+
+# ── Defaults ───────────────────────────────────────────────────────────────
+defaults:
+  cap_policy: scrap             # scrap card when max_execution_attempts exceeded
+  on_dep_scrap: hold            # hold parent when a dependency is scrapped
+
+# ── Terminal lanes ─────────────────────────────────────────────────────────
+terminal_lanes: [done, scrap, hold]
+
+# ── Stations ───────────────────────────────────────────────────────────────
+stations:
+  # ── FIRST WORK STATION ───────────────────────────────────────────────────
+  # plan: transforms the incoming request into a structured plan.
+  # Gate check guards quality; on_reject loops back to plan itself.
+  # fan_out: 3 spawns exactly 3 child cards — one per variant.
+  - id: plan
+    worker:
+      kind: transform
+      role: planner
+      model: gpt-4o-mini
+    wip: 5
+    inputs: [request.json]
+    outputs: [plan.json]
+    check:
+      kind: gate
+      class: taste
+      critic:
+        role: plan-critic
+        model: gpt-4o-mini
+      on_reject: plan           # back-edge to first work station
+      rework_cap: 3
+      progress_signal: findings_hash
+    fan_out: 3                  # 1 parent → 3 child cards
+
+  # ── CHILD TRACK (each of the 3 children runs draft → publish) ────────────
+  # draft: transform that writes the content body for one variant.
+  - id: draft
+    worker:
+      kind: transform
+      role: drafter
+      model: gpt-4o-mini
+    wip: 10
+    inputs: [plan.json]
+    outputs: [draft.md]
+
+  # publish: last work station before fan-in; the sole effectful station.
+  # Sends the artifact to an external service (irreversible side-effect).
+  - id: publish
+    worker:
+      kind: transform
+      role: publisher
+      model: gpt-4o-mini
+    effectful: true             # only effectful station in the flow
+    wip: 10
+    inputs: [draft.md]
+    outputs: [published.md]
+
+  # ── RANK / HITL STATION ──────────────────────────────────────────────────
+  # select: rank check-only station (no worker).
+  # Scores the 3 published outputs; routes to hold for HITL selection via
+  # the slack egress channel; if all variants fail the quality bar,
+  # on_reject sends the card back to draft for rework.
+  - id: select
+    check:
+      kind: rank
+      class: taste
+      critic:
+        role: selector
+        model: gpt-4o
+      on_reject: draft          # rework back-edge when no variant passes
+      rework_cap: 2
+      progress_signal: findings_hash
+
+  # ── FAN-IN ───────────────────────────────────────────────────────────────
+  # assemble: deterministic fan-in with quorum(2).
+  # At least 2 of the 3 children must reach a non-scrap terminal lane;
+  # fewer than 2 trips the fan-in failure policy (cap_policy default: scrap).
+  - id: assemble
+    worker:
+      kind: deterministic
+      role: assembler
+    wip: 3
+    inputs: [published.md]
+    outputs: [final.zip]
+    fan_in:
+      policy: quorum
+      k: 2                      # quorum(2): 2-of-3 children required
+
+# ── Channels ───────────────────────────────────────────────────────────────
+channels:
+  ingress:
+    type: cli                   # manual / CLI-triggered runs (MVP default)
+  egress:
+    - type: slack
+      target: "#content-pipeline"
+      uses: [status, hitl, alerts, delivery]
+      hold_timeout_seconds: 30  # HITL hold timeout (hold-timeout path)
+      on_timeout: scrap         # required when hold_timeout is set (SPEC §4A)
+
+# ── Security ───────────────────────────────────────────────────────────────
+security:
+  bash:
+    allow: []                   # no shell commands needed for this flow
+    deny_shell_metachars: true
+  network_egress: deny

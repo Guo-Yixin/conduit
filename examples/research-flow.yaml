@@ -1,0 +1,87 @@
+# research-flow — Phase-1 exit-criterion example: a harness maker with an
+# adversarial harness critic (SPEC §9c, "kind: harness" precursor tier).
+#
+# One station does both jobs, in the idiomatic Conduit shape (worker + inline
+# check gating advancement to `next`):
+#   - worker (kind: harness, claude-headless) reads topic.md and writes
+#     findings.md — a short researched answer to the question in topic.md.
+#   - check.critic (also claude-headless, a DIFFERENT prompt/model role) reads
+#     topic.md + findings.md and adversarially verifies the finding, writing
+#     its pass/reject verdict to verdict.json (WI-570 agentic critic).
+#
+# "Adversarial" here is the critic's distinct role/prompt, not a second
+# adapter — one adapter (claude-headless) plays both parts, exactly as WI-595
+# will run this against the real `claude` binary.
+#
+# Deliberately tiny + cheap (WI-595 spends REAL tokens executing this exact
+# flow): a one-line topic, a <100-word summary, the haiku model, and a bounded
+# per-run token budget. max_tokens is sized for the REAL headless claude CLI,
+# not a bare chat call: a single claude-headless invocation carries ~80k+
+# input tokens of system-prompt/tool overhead regardless of the tiny prompt
+# text, so the maker+critic pair needs real headroom, not a chat-sized budget
+# (a WI-595 real-run finding — 20000 halted the run at the maker via the
+# consumption andon, working as designed against the wrong number).
+#
+# max_execution_attempts: 3 matches rework_cap: 2 below (1 initial attempt +
+# 2 reworks = 3 total maker dispatches) — a WI-595 real-run finding: with only
+# 2 total attempts, a single rejected rework left NO headroom for a second
+# reject/rework cycle, so a live critic rejecting twice (a legitimate, if
+# infrequent, live-judgment outcome — see prompts/research.md and
+# prompts/research-critic.md's identical objective checklist, which narrows
+# but does not eliminate that variance) scrapped the card before the kernel's
+# own rework loop got a real chance to self-heal. Budget raised accordingly:
+# up to 3 maker + 3 critic real invocations, each carrying claude-headless's
+# ~80k+ fixed overhead.
+
+flow: research-flow
+project_root: .
+flow_version: 1
+
+budgets:
+  run:
+    wall_clock_minutes: 10
+    max_tokens: 800000
+  per_card:
+    max_execution_attempts: 3
+  liveness:
+    no_progress_minutes: 3
+
+defaults:
+  enforce_owned_paths: true
+
+terminal_lanes: [done, scrap, hold]
+
+stations:
+  - id: research
+    worker:
+      kind: harness
+      harness: claude-headless
+      model: claude-haiku-4-5-20251001
+      tools: [Read, Write]
+      prompt_file: prompts/research.md
+      prompt_version: "1"
+      output_schema:
+        fields:
+          - { name: summary, type: string, required: true }
+    inputs: [topic.md]
+    outputs: [findings.md]
+    next: done
+    check:
+      kind: gate
+      critic:
+        role: adversarial-research-critic
+        harness: claude-headless
+        model: claude-haiku-4-5-20251001
+        # The critic must Write verdict.json (WI-570 agentic critic) — without
+        # a declared tools allowlist reaching the invoke, claude-headless gets
+        # no --allowed-tools and cannot write its own verdict (a WI-595 real-run
+        # finding; the fix threading this through lives in quality/gate.ts).
+        tools: [Read, Write]
+        prompt_file: prompts/research-critic.md
+        prompt_version: "1"
+      on_reject: research
+      rework_cap: 2
+
+channels:
+  ingress:
+    type: cli

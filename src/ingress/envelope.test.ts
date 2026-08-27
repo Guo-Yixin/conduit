@@ -1,0 +1,240 @@
+/**
+ * Tests for the canonical deterministic substrate envelope (WI-403, SPEC §9 / D3, FR-10).
+ *
+ * The ingress listener turns every accepted event into a canonical, deterministic
+ * substrate envelope — written onto the parent card's substrate before spawning
+ * `conduit run`. A binding may additionally declare a deterministic JSON-path
+ * `substrate` mapping (Record<string, string>, see src/ingress/binding.ts) that
+ * projects envelope fields onto named substrate fields. NO model call, no
+ * randomness, no Date.now() — determinism is load-bearing (received_at is passed
+ * in by the caller).
+ *
+ * Contract this file pins for src/ingress/envelope.ts:
+ *
+ *   export interface SubstrateEnvelope {
+ *     source: string;
+ *     event_id: string;
+ *     received_at: number;
+ *     auth_verified: boolean;
+ *     headers: Record<string, unknown>;   // secret-filtered via db.ts filterAttributes
+ *     body: unknown;
+ *     attachments: unknown[];             // [] when none supplied
+ *   }
+ *
+ *   export function buildEnvelope(input: {
+ *     source: string;
+ *     eventId: string;
+ *     receivedAt: number;
+ *     authVerified: boolean;
+ *     headers: Record<string, unknown>;
+ *     body: unknown;
+ *     attachments?: unknown[];
+ *   }): SubstrateEnvelope
+ *
+ *   // Projects named substrate fields out of the envelope via JSON-paths ("$.a.b").
+ *   // Absent a mapping, returns the raw canonical envelope unchanged.
+ *   export function projectSubstrate(
+ *     envelope: SubstrateEnvelope,
+ *     mapping?: Record<string, string>,
+ *   ): Record<string, unknown>
+ *
+ * Contract decision (AC6 "absent/null"): an unresolved JSON-path yields the
+ * target field PRESENT with value `null` — not an omitted key. A stable key set
+ * keeps projection output byte-identical/deterministic regardless of which paths
+ * happen to resolve.
+ *
+ * RED state before WI-403: src/ingress/envelope.ts does not exist, so the import
+ * below fails to resolve and every test errors at module load.
+ */
+import { describe, it, expect } from 'bun:test';
+import { buildEnvelope, projectSubstrate } from './envelope';
+
+// A representative accepted-event input. Headers carry a real secret so the
+// filter wiring (AC2/AC3) is exercised against the actual db.ts filterAttributes.
+function sampleInput() {
+  return {
+    source: 'webhook:github',
+    eventId: 'evt-123',
+    receivedAt: 1_700_000_000_000,
+    authVerified: true,
+    headers: {
+      'x-github-event': 'issues',
+      authorization: 'Bearer ghp_super_secret_value',
+    },
+    body: { issue: { title: 'Bug report', number: 42 }, action: 'opened' },
+    attachments: [],
+  };
+}
+
+// ---------------------------------------------------------------------------
+// AC1 — buildEnvelope returns the canonical snake_case object; attachments
+//       default to [] when none are present.
+// ---------------------------------------------------------------------------
+describe('buildEnvelope', () => {
+  it('maps camelCase input into the canonical snake_case envelope', () => {
+    const env = buildEnvelope({
+      source: 'cli:local',
+      eventId: 'evt-1',
+      receivedAt: 1_700_000_000_000,
+      authVerified: false,
+      headers: { 'content-type': 'application/json' },
+      body: { hello: 'world' },
+      attachments: [{ name: 'a.txt' }],
+    });
+
+    expect(env).toEqual({
+      source: 'cli:local',
+      event_id: 'evt-1',
+      received_at: 1_700_000_000_000,
+      auth_verified: false,
+      headers: { 'content-type': 'application/json' },
+      body: { hello: 'world' },
+      attachments: [{ name: 'a.txt' }],
+    });
+  });
+
+  it('defaults attachments to an empty array when none are provided', () => {
+    const env = buildEnvelope({
+      source: 'slack:C123',
+      eventId: 'evt-2',
+      receivedAt: 1_700_000_000_001,
+      authVerified: true,
+      headers: {},
+      body: { text: 'hi' },
+      // no attachments key
+    });
+
+    expect(env.attachments).toEqual([]);
+  });
+
+  it('preserves provided attachments', () => {
+    const env = buildEnvelope({
+      source: 'slack:C123',
+      eventId: 'evt-3',
+      receivedAt: 1_700_000_000_002,
+      authVerified: true,
+      headers: {},
+      body: {},
+      attachments: [{ id: 'f1' }, { id: 'f2' }],
+    });
+
+    expect(env.attachments).toEqual([{ id: 'f1' }, { id: 'f2' }]);
+  });
+
+  // AC2 + AC3 — headers go through the REAL exported filterAttributes; a
+  // sensitive header is DROPPED (not masked), leaving no trace of the secret.
+  it('filters sensitive headers through db.ts filterAttributes (drops, does not mask)', () => {
+    const env = buildEnvelope(sampleInput());
+
+    // The sensitive key is gone entirely — not present, not masked.
+    expect('authorization' in env.headers).toBe(false);
+    // Non-sensitive headers survive untouched.
+    expect(env.headers).toEqual({ 'x-github-event': 'issues' });
+    // No trace of the raw secret value anywhere in the serialized envelope.
+    expect(JSON.stringify(env)).not.toContain('ghp_super_secret_value');
+  });
+
+  // Determinism (D3/FR-10): received_at is threaded straight through (no internal
+  // Date.now()), and identical input yields byte-identical output.
+  it('threads received_at through unchanged and is deterministic across identical calls', () => {
+    const a = buildEnvelope(sampleInput());
+    const b = buildEnvelope(sampleInput());
+
+    expect(a.received_at).toBe(1_700_000_000_000);
+    expect(JSON.stringify(a)).toBe(JSON.stringify(b));
+  });
+});
+
+// ---------------------------------------------------------------------------
+// AC4/AC5/AC6 — projectSubstrate evaluates a binding's JSON-path mapping
+//               against the envelope, deterministically.
+// ---------------------------------------------------------------------------
+describe('projectSubstrate', () => {
+  it('projects named substrate fields from the envelope via JSON-paths', () => {
+    const env = buildEnvelope(sampleInput());
+
+    const substrate = projectSubstrate(env, {
+      subject: '$.body.issue.title',
+      issueNumber: '$.body.issue.number',
+      action: '$.body.action',
+      src: '$.source',
+      verified: '$.auth_verified',
+    });
+
+    expect(substrate).toEqual({
+      subject: 'Bug report',
+      issueNumber: 42,
+      action: 'opened',
+      src: 'webhook:github',
+      verified: true,
+    });
+  });
+
+  // The original JSON-path array-projection work — numeric segments index into arrays. This is the motivating
+  // Slack file_share case: event.files[] is the only place the file url lives.
+  it('projects array elements via numeric path segments (The original JSON-path array-projection work)', () => {
+    const env = buildEnvelope({
+      ...sampleInput(),
+      body: {
+        event: {
+          ts: '1720000000.000100',
+          files: [{ url_private_download: 'https://files.slack.com/F111' }],
+        },
+      },
+    });
+
+    const substrate = projectSubstrate(env, {
+      file_url: '$.body.event.files.0.url_private_download',
+      thread_ts: '$.body.event.ts',
+      missing_file: '$.body.event.files.1.url_private_download',
+    });
+
+    expect(substrate).toEqual({
+      file_url: 'https://files.slack.com/F111',
+      thread_ts: '1720000000.000100',
+      missing_file: null,
+    });
+  });
+
+  it('produces byte-identical output for the same envelope + mapping (determinism)', () => {
+    const mapping = { subject: '$.body.issue.title', src: '$.source' };
+    const first = projectSubstrate(buildEnvelope(sampleInput()), mapping);
+    const second = projectSubstrate(buildEnvelope(sampleInput()), mapping);
+
+    expect(JSON.stringify(first)).toBe(JSON.stringify(second));
+  });
+
+  it('returns the raw canonical envelope unchanged when no mapping is given (AC5)', () => {
+    const env = buildEnvelope(sampleInput());
+
+    expect(projectSubstrate(env)).toEqual(env);
+  });
+
+  // AC6 — an unresolved JSON-path yields a null target field rather than throwing.
+  // Includes a path whose INTERMEDIATE segment is missing (must not throw).
+  it.each([
+    ['leaf is missing', '$.body.issue.nonexistent'],
+    ['intermediate is missing', '$.body.pull_request.title'],
+    ['top-level key is missing', '$.comments'],
+  ])('yields null for a JSON-path that resolves to no value (%s)', (_label, path) => {
+    const env = buildEnvelope(sampleInput());
+
+    let substrate: Record<string, unknown>;
+    expect(() => {
+      substrate = projectSubstrate(env, { target: path });
+    }).not.toThrow();
+
+    expect(substrate!.target).toBeNull();
+  });
+
+  // AC6 tail — building and projecting invoke no model/LLM call. There is no LLM
+  // boundary in this module to mock; the observable contract is that both
+  // functions complete synchronously (a model call would be async).
+  it('executes synchronously with no model/LLM call', () => {
+    const env = buildEnvelope(sampleInput());
+    const substrate = projectSubstrate(env, { src: '$.source' });
+
+    expect(env).not.toBeInstanceOf(Promise);
+    expect(substrate).not.toBeInstanceOf(Promise);
+  });
+});

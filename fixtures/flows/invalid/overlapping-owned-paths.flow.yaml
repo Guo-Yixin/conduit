@@ -1,0 +1,63 @@
+# Invalid fixture: overlapping-owned-paths (WI-291)
+#
+# Defect: stations 'write' and 'edit' both declare 'draft.md' in their
+# outputs list. Concurrent cards at these stations would race to write
+# the same file, violating the disjoint ownership invariant (SPEC §9).
+#
+# Result: the validator must reject this config at load because the
+# owned-path sets are not disjoint — the same path appears in two
+# stations that could be concurrently eligible.
+#
+# This file is syntactically valid YAML; the error is semantic.
+
+flow: overlapping-paths-example
+project_root: ./workspace
+flow_version: 1
+
+budgets:
+  run:
+    wall_clock_minutes: 10
+    max_tokens: 100000
+  per_card:
+    max_execution_attempts: 3
+  liveness:
+    no_progress_minutes: 5
+
+defaults:
+  cap_policy: scrap
+  on_dep_scrap: hold
+
+terminal_lanes: [done, scrap, hold]
+
+stations:
+  # 'write' owns draft.md …
+  - id: write
+    worker:
+      kind: transform
+      role: writer
+      model: gpt-4o-mini
+    wip: 5
+    inputs: [request.json]
+    outputs: [draft.md]         # claims draft.md
+
+  # … 'edit' also claims draft.md → overlapping ownership
+  - id: edit
+    worker:
+      kind: transform
+      role: editor
+      model: gpt-4o-mini
+    wip: 5
+    inputs: [notes.json]
+    outputs: [draft.md]         # ERROR: same path as 'write'
+
+  - id: publish
+    worker:
+      kind: deterministic
+      role: publisher
+    wip: 3
+    inputs: [draft.md]
+    outputs: [final.md]
+
+channels:
+  ingress:
+    type: cli

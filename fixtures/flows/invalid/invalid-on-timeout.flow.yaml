@@ -1,0 +1,68 @@
+# Invalid fixture: invalid-on-timeout (WI-398)
+#
+# Defect: the slack egress channel declares an on_timeout value that is not one
+# of the three policies the kernel honours (scrap / proceed_with_findings /
+# escalate).
+#
+# Per SPEC §4A the executor only acts on those three policies; an unrecognised
+# value would silently no-op at timeout (a held card would wait forever). The
+# loader must therefore REJECT it at load (fail-closed: config is validated,
+# not trusted).
+#
+# This file is syntactically valid YAML; the error is semantic.
+
+flow: invalid-on-timeout-example
+project_root: ./workspace
+flow_version: 1
+
+budgets:
+  run:
+    wall_clock_minutes: 10
+    max_tokens: 100000
+  per_card:
+    max_execution_attempts: 3
+  liveness:
+    no_progress_minutes: 5
+
+defaults:
+  cap_policy: scrap
+  on_dep_scrap: hold
+
+terminal_lanes: [done, scrap, hold]
+
+stations:
+  - id: write
+    worker:
+      kind: transform
+      role: writer
+      model: gpt-4o-mini
+    wip: 5
+    inputs: [request.json]
+    outputs: [draft.md]
+    check:
+      kind: rank
+      class: taste
+      critic:
+        role: selector
+        model: gpt-4o-mini
+      on_reject: write
+      rework_cap: 2
+      progress_signal: findings_hash
+
+  - id: publish
+    worker:
+      kind: deterministic
+      role: publisher
+    wip: 3
+    inputs: [draft.md]
+    outputs: [final.md]
+
+channels:
+  ingress:
+    type: cli
+  egress:
+    - type: slack
+      target: "#content"
+      uses: [status, hitl, alerts, delivery]
+      hold_timeout_seconds: 30
+      on_timeout: yolo  # not a legal policy — must be rejected at load

@@ -1,0 +1,39 @@
+# Test gate — typecheck + full unit/integration suite on every PR.
+#
+# This is the required check for merging (branch protection targets the
+# `tests` job by name). Keep it hermetic: no repo secrets, no .env — any test
+# that needs gateway config must inject its own inert test values.
+# Baseline at introduction: ~2.6k tests in under a minute locally; the
+# timeout is generous headroom for slower shared runners, not an expectation.
+#
+# Run the scoped `bun run test` script (src/ only), NOT bare `bun test` —
+# bun's default test discovery walks the whole repo tree, so a bare `bun
+# test` would also pick up blackbox/ and fold that advisory-only suite into
+# this required gate, defeating its non-blocking burn-in period (DQ-3).
+name: Tests
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+jobs:
+  tests:
+    name: tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.3.11 # keep in step with the version developed against
+
+      - name: Install (frozen lockfile)
+        run: bun install --frozen-lockfile
+
+      - name: Typecheck
+        run: bun run typecheck
+
+      - name: Test
+        run: bun run test

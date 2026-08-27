@@ -1,0 +1,57 @@
+# Invalid fixture: cyclic-deps (WI-291)
+#
+# Defect: stations alpha and beta form a mutual data-dependency cycle.
+#   alpha.depends_on: [beta]  →  beta must complete before alpha starts
+#   beta.depends_on:  [alpha] →  alpha must complete before beta starts
+#
+# Result: neither station can ever reach ready status — a deadlock at
+# load time. The validator must reject this config with a cycle-detection
+# error before any run is started.
+#
+# This file is syntactically valid YAML; the error is semantic.
+
+flow: cyclic-deps-example
+project_root: ./workspace
+flow_version: 1
+
+budgets:
+  run:
+    wall_clock_minutes: 10
+    max_tokens: 100000
+  per_card:
+    max_execution_attempts: 3
+  liveness:
+    no_progress_minutes: 5
+
+defaults:
+  cap_policy: scrap
+  on_dep_scrap: hold
+
+terminal_lanes: [done, scrap, hold]
+
+stations:
+  # alpha depends on beta completing first …
+  - id: alpha
+    worker:
+      kind: transform
+      role: writer
+      model: gpt-4o-mini
+    wip: 5
+    inputs: [beta-output.json]    # consumes beta's output
+    outputs: [alpha-output.json]
+    depends_on: [beta]            # cycle: alpha needs beta
+
+  # … but beta depends on alpha completing first → unresolvable cycle
+  - id: beta
+    worker:
+      kind: transform
+      role: reviewer
+      model: gpt-4o-mini
+    wip: 5
+    inputs: [alpha-output.json]   # consumes alpha's output
+    outputs: [beta-output.json]
+    depends_on: [alpha]           # cycle: beta needs alpha
+
+channels:
+  ingress:
+    type: cli

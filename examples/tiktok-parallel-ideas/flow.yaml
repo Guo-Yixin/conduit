@@ -1,0 +1,140 @@
+# tiktok-parallel-ideas — fan-out the tiktok ideation flow across N products.
+#
+#   select (deterministic, DuckDB)         pick top-5 + bottom-5 by sales velocity
+#     -> plan (transform, FAN-OUT N=10)    emit one child lane per product
+#          └─ child: ideate (transform + gate) -> done     the normal ideation, per product
+#     -> collect (deterministic, FAN-IN: all)  gather the 10 ideas
+#       -> done
+#
+# This is the Studio fan-out pattern (one trigger -> N parallel asset lanes)
+# applied to the linear `tiktok-shoppable-ideas` flow: instead of one idea for
+# one product, fan out to one idea per product across a selected batch.
+#
+# ── What runs TODAY vs. what the companion PRD adds ──────────────────────────
+# The TOPOLOGY here loads and renders (`conduit explain`) and the fan-out/fan-in
+# machinery is wired. Two things are NOT yet first-class in the kernel and are
+# the subject of prd/done/parallel-lane-execution.md:
+#
+#   1. PER-CHILD INPUT BINDING. Fan-out children carry only `id` + `owned_paths`
+#      (see src/dag/expand.ts ProposedChild) — there is no per-child input
+#      artifact, and the project root / cwd is shared across the run. So today
+#      every `ideate` child renders the SAME prompt against the SAME inputs
+#      (N stochastic variants), NOT product-i-per-lane. Delivering a distinct
+#      product to each lane needs per-child input binding.
+#   2. CONCURRENT EXECUTION. The executor is single-in-flight: the 10 lanes run
+#      one at a time. The output is identical; only wall-clock differs. Running
+#      "5 or 10 at a time" needs bounded concurrent dispatch under the `wip` cap.
+#
+# Until those land, treat this as the canonical TARGET flow for the use case.
+
+flow: tiktok-parallel-ideas
+project_root: .
+flow_version: 1
+
+budgets:
+  run:
+    wall_clock_minutes: 20
+    max_tokens: 400000
+  per_card:
+    max_execution_attempts: 4
+  # Per-wave (subtree) cap: the 10-lane batch is ONE parent_id subtree, so a
+  # runaway batch is scrapped without halting the whole run (SPEC §6/§8).
+  per_wave:
+    max_tokens: 120000
+  liveness:
+    no_progress_minutes: 3
+
+defaults:
+  cap_policy: scrap
+  on_dep_scrap: hold
+  # Each lane owns a disjoint output dir (ideas/<product>/); enforce it so one
+  # product's lane physically cannot stomp another's output.
+  enforce_owned_paths: true
+
+terminal_lanes: [done, scrap, hold]
+
+stations:
+  # 1. Rank products by recent sales velocity and select the top-5 + bottom-5.
+  #    Deterministic — selection is a query, not a judgment call.
+  - id: select
+    worker:
+      kind: deterministic
+      role: selector
+      command: duckdb
+      args: ["-readonly", "fixtures/fixture.duckdb", "-f", "select.sql"]
+    inputs: [request.json]
+    outputs: [selected.json]
+    next: plan
+
+  # 2. Fan-out parent: turn the 10 selected products into 10 child lanes.
+  #    The fan-out parent must be a `transform` (it emits the typed children
+  #    proposal); a future deterministic-fan-out would let this be pure code.
+  - id: plan
+    worker:
+      kind: transform
+      role: planner
+      model: gemini-flash-lite-latest
+      prompt_file: prompts/plan.md
+      prompt_version: "1"
+      output_schema:
+        fields:
+          - { name: children, type: object, required: true }
+    inputs: [selected.json]
+    outputs: [plan.json]
+    fan_out: 10
+    child_entry: ideate
+    child_terminal: done
+    resume_at: collect
+    next: collect
+
+  # 3. Child sub-path: the normal ideation, gated — runs once per product lane.
+  - id: ideate
+    worker:
+      kind: transform
+      role: creative-strategist
+      model: gemini-flash-lite-latest
+      prompt_file: prompts/ideate.md
+      prompt_version: "1"
+      params:
+        temperature: 0.7
+      output_schema:
+        fields:
+          - { name: featured_variant, type: string, required: true }
+          - { name: hook,             type: string, required: true }
+          - { name: filming_idea,     type: string, required: true }
+    inputs: [context.json, feedback]
+    outputs: [idea.json]
+    next: done
+    check:
+      kind: gate
+      class: taste
+      critic:
+        role: ad-critic
+        model: gpt-4o
+        prompt_file: prompts/verify.md
+        prompt_version: "1"
+      on_reject: ideate
+      rework_cap: 2
+      progress_signal: findings_hash
+
+  # 4. Fan-in: wait for ALL lanes, then assemble the batch of ideas.
+  - id: collect
+    worker:
+      kind: deterministic
+      role: assembler
+      command: "true"
+    inputs: []
+    outputs: []
+    fan_in:
+      policy: all
+    next: done
+
+channels:
+  ingress:
+    type: cli
+
+security:
+  bash:
+    allow: ["duckdb", "true"]
+    deny_shell_metachars: true
+  network_egress: allow

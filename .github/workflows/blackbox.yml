@@ -1,0 +1,36 @@
+# Black-box suite — separate, NOT a required check (DQ-3).
+#
+# This workflow runs blackbox/ against every PR for visibility, but it is
+# deliberately kept out of GitHub branch protection's required-check set.
+# The required gate is the `tests` job in test.yml only — this workflow must
+# never define a job named `tests`, or it would be folded into that gate.
+#
+# Burn-in-then-promote plan: run this suite as advisory-only (non-blocking)
+# for roughly 2 weeks / ~50 PRs to shake out flakiness and environment gaps
+# before it is considered for promotion to a required check. Once burn-in is
+# clean, a follow-up change flips branch protection to require this job too.
+name: Black-box
+
+on:
+  pull_request:
+
+jobs:
+  blackbox:
+    name: blackbox
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.3.11 # keep in step with test.yml
+
+      - name: Install (frozen lockfile)
+        run: bun install --frozen-lockfile
+
+      - name: Black-box typecheck
+        run: bun run typecheck:blackbox
+
+      - name: Black-box test
+        run: bun run test:blackbox

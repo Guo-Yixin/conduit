@@ -1,0 +1,125 @@
+# branching — Studio-style fan-out + rank + HITL example (WI-399).
+#
+#   brief (fan-out, N=3) -> [child: draft -> publish -> done] -> assemble (quorum fan-in)
+#     -> rank (HITL) -> deliver -> done
+#
+# Real prompt templates live under prompts/. Driven end-to-end by the kernel
+# with no kernel-code changes (flow-is-config).
+
+flow: branching
+project_root: .
+flow_version: 1
+prerequisites: [jq]
+
+budgets:
+  run:
+    wall_clock_minutes: 10
+    max_tokens: 200000
+  per_card:
+    max_execution_attempts: 4
+  liveness:
+    no_progress_minutes: 3
+
+defaults:
+  cap_policy: scrap
+  on_dep_scrap: hold
+
+terminal_lanes: [done, scrap, hold]
+
+channels:
+  ingress:
+    type: cli
+  egress:
+    - type: slack
+      target: "#studio-hitl"
+      uses: [hitl, delivery]
+      hold_timeout_seconds: 30
+      on_timeout: scrap
+
+stations:
+  # Fan-out: decompose the brief into N=3 variant child cards.
+  - id: brief
+    worker:
+      kind: transform
+      role: director
+      model: brief-model
+      prompt_file: prompts/brief.md
+      prompt_version: "1"
+      output_schema:
+        fields:
+          - { name: children, type: object, required: true }
+    inputs: []
+    outputs: [plan.json]
+    fan_out: 3
+    child_entry: draft
+    child_terminal: done
+    resume_at: assemble
+    next: assemble
+
+  # Child sub-path: draft -> publish -> done.
+  - id: draft
+    worker:
+      kind: transform
+      role: drafter
+      model: draft-model
+      prompt_file: prompts/draft.md
+      prompt_version: "1"
+      output_schema:
+        fields:
+          - { name: draft, type: string, required: true }
+    inputs: []
+    outputs: [draft.md]
+    next: publish
+
+  - id: publish
+    worker:
+      kind: deterministic
+      role: publisher
+      command: "true"
+    inputs: []
+    outputs: []
+    next: done
+
+  # Quorum fan-in: at least 2 of 3 variants must survive. resume_at target.
+  - id: assemble
+    worker:
+      kind: deterministic
+      role: assembler
+      command: "true"
+    inputs: []
+    outputs: []
+    fan_in:
+      policy: quorum
+      k: 2
+    next: rank
+
+  # Rank + HITL: rank the survivors, post the short-list, hold for a human pick.
+  - id: rank
+    check:
+      kind: rank
+      class: taste
+      critic:
+        role: selector
+        model: rank-model
+        prompt_file: prompts/rank.md
+        prompt_version: "1"
+      no_selection_policy: scrap
+    inputs: []
+    outputs: []
+    next: deliver
+
+  # Post-rank delivery terminal.
+  - id: deliver
+    worker:
+      kind: deterministic
+      role: deliverer
+      command: "true"
+    inputs: []
+    outputs: []
+    next: done
+
+security:
+  bash:
+    allow: ["true"]
+    deny_shell_metachars: true
+  network_egress: allow

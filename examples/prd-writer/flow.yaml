@@ -1,0 +1,55 @@
+# prd-writer — harness maker drafts a PRD from a brief; adversarial harness
+# critic verifies structure/scope/honesty before the card advances.
+# Example flow: harness-maker (kind: harness, claude-headless) drafting a PRD,
+# gated by a distinct adversarial critic role/model — the same maker+critic
+# shape as ../research-flow.yaml, applied to a real, multi-page PRD-drafting
+# workload instead of a one-line research question. See README.md for the
+# input this station's prompts expect that isn't committed here.
+flow: prd-writer
+project_root: .
+flow_version: 1
+
+budgets:
+  run:
+    wall_clock_minutes: 25
+    max_tokens: 2500000
+  per_card:
+    max_execution_attempts: 3
+  liveness:
+    no_progress_minutes: 10
+
+defaults:
+  enforce_owned_paths: true
+
+terminal_lanes: [done, scrap, hold]
+
+stations:
+  - id: draft-prd
+    worker:
+      kind: harness
+      harness: claude-headless
+      model: claude-sonnet-5
+      tools: [Read, Write]
+      prompt_file: prompts/prd-writer.md
+      prompt_version: "1"
+      output_schema:
+        fields:
+          - { name: summary, type: string, required: true }
+    inputs: [brief.md, reference-prd.md]
+    outputs: [result.json, draft-prd.md]
+    next: done
+    check:
+      kind: gate
+      critic:
+        role: adversarial-prd-critic
+        harness: claude-headless
+        model: claude-haiku-4-5-20251001
+        tools: [Read, Write]
+        prompt_file: prompts/prd-critic.md
+        prompt_version: "1"
+      on_reject: draft-prd
+      rework_cap: 2
+
+channels:
+  ingress:
+    type: cli

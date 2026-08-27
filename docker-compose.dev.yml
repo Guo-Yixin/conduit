@@ -1,0 +1,42 @@
+# docker-compose.dev.yml — dev-iteration stack (WI-439, FR-12a)
+#
+# Topology:
+#   engine   — the conduit-engine image with the project bind-mounted
+#              (edit-and-re-run: source changes are visible without rebuilding)
+#   model    — local model sidecar endpoint (Ollama); engine talks to it via
+#              CONDUIT_BASE_URL so no model is baked into the engine image (FR-9)
+#
+# State persistence: conduit_data named volume mounted at /data (FR-6).
+# Secrets: never baked in — set CONDUIT_API_KEY in the shell or a .env file (FR-5).
+
+services:
+  engine:
+    image: conduit-engine
+    profiles: ["tools"]
+    volumes:
+      # Project bind-mount: live source edits without image rebuild (FR-12a)
+      - .:/app
+      # Named state volume: conduit.sqlite lives here, not in the container FS (FR-6)
+      - conduit_data:/data
+    environment:
+      # Model gateway endpoint — points at the sidecar service below (FR-9)
+      CONDUIT_BASE_URL: http://model:11434/v1
+      # Secret env vars are interpolated from the host shell / .env file (FR-5)
+      CONDUIT_API_KEY: ${CONDUIT_API_KEY:-}
+    depends_on:
+      - model
+
+  model:
+    # Local Ollama inference server — acts as the model gateway endpoint.
+    # Switch to any OpenAI-compatible proxy (LiteLLM, vLLM, etc.) as needed.
+    image: ollama/ollama
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama_models:/root/.ollama
+
+volumes:
+  # Named volume for conduit.sqlite + WAL files; mount this at /data (FR-6)
+  conduit_data:
+  # Named volume for Ollama model weights so they survive container restarts
+  ollama_models:

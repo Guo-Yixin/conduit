@@ -1,0 +1,261 @@
+# A(i)-Team orchestration sketch.
+#
+# This fixture is for explain/D2 renderer dogfooding. It models the shape of the
+# A-Team plugin flow without trying to be a runnable mission definition.
+#
+# Key visual behaviors:
+#   - planning prelude with Sosa critique loop
+#   - controller split into N item lanes
+#   - per-item lane is Murdock -> B.A. -> Lynch -> Amy
+#   - the lane stages are Testing -> Coding -> Reviewing -> Manual testing
+#   - review/probe backflow to earlier item-lane stages
+#   - fan-in once all item lanes reach item_done
+#   - final mission review can send named items back through the item pipeline
+
+flow: aiteam-mission-orchestration
+project_root: ./workspace
+flow_version: 1
+
+budgets:
+  run:
+    wall_clock_minutes: 240
+    max_tokens: 4000000
+  per_wave:
+    max_tokens: 1000000
+    max_dispatches: 200
+  per_card:
+    max_execution_attempts: 4
+  liveness:
+    no_progress_minutes: 10
+
+defaults:
+  cap_policy: scrap
+  on_dep_scrap: hold
+
+# item_done is the terminal for each spawned work item. The parent mission
+# resumes at join after fan-in, then continues to final review.
+terminal_lanes: [item_done, done, blocked, hold]
+
+stations:
+  # Planning prelude: PRD -> Face decomposition -> Sosa critique -> revision.
+  - id: plan
+    worker:
+      kind: agentic
+      role: Face planner
+      model: opus
+      prompt_file: prompts/aiteam.md
+      prompt_version: "1"
+      output_schema:
+        fields:
+          - { name: summary, type: string, required: true }
+    wip: 1
+    inputs: [prd.md]
+    outputs: [items.json]
+    next: deps
+    check:
+      kind: gate
+      class: requirements
+      critic:
+        role: Sosa
+        model: opus
+      on_reject: plan
+      rework_cap: 2
+      progress_signal: findings_hash
+
+  # Dependency validation and wave setup. Items with unmet dependencies remain
+  # in briefings; dep-ready items move into the ready queue.
+  - id: deps
+    worker:
+      kind: deterministic
+      role: deps check
+      command: "true"
+    wip: 1
+    inputs: [items.json]
+    outputs: [ready-wave.json]
+    next: dispatch
+
+  # Hannibal/controller dispatches ready work into N parallel item lanes.
+  - id: dispatch
+    worker:
+      kind: deterministic
+      role: Hannibal controller
+      command: "true"
+    wip: 1
+    inputs: [ready-wave.json]
+    outputs: [lane-plan.json]
+    fan_out: 4
+    child_entry: testing
+    child_terminal: item_done
+    resume_at: join
+    next: join
+
+  # Per-item child lane: Murdock -> B.A. -> Lynch -> Amy.
+  - id: testing
+    worker:
+      kind: agentic
+      role: Murdock
+      model: sonnet
+      prompt_file: prompts/aiteam.md
+      prompt_version: "1"
+      output_schema:
+        fields:
+          - { name: summary, type: string, required: true }
+    wip: 4
+    inputs: [item.json]
+    outputs: [tests.diff]
+    next: coding
+
+  - id: coding
+    worker:
+      kind: agentic
+      role: B.A.
+      model: sonnet
+      prompt_file: prompts/aiteam.md
+      prompt_version: "1"
+      output_schema:
+        fields:
+          - { name: summary, type: string, required: true }
+    wip: 4
+    inputs: [tests.diff]
+    outputs: [implementation.diff]
+    next: reviewing
+    check:
+      kind: gate
+      class: test-validity
+      critic:
+        role: BA test bug
+        model: sonnet
+      on_reject: testing
+      rework_cap: 4
+      progress_signal: findings_hash
+
+  - id: reviewing
+    worker:
+      kind: agentic
+      role: Lynch
+      model: sonnet
+      prompt_file: prompts/aiteam.md
+      prompt_version: "1"
+      output_schema:
+        fields:
+          - { name: summary, type: string, required: true }
+    wip: 4
+    inputs: [tests.diff, implementation.diff]
+    outputs: [review.json]
+    next: manual_testing
+    check:
+      kind: gate
+      class: implementation
+      critic:
+        role: Lynch review
+        model: sonnet
+      on_reject: coding
+      rework_cap: 4
+      progress_signal: findings_hash
+
+  - id: manual_testing
+    worker:
+      kind: agentic
+      role: Amy
+      model: sonnet
+      prompt_file: prompts/aiteam.md
+      prompt_version: "1"
+      output_schema:
+        fields:
+          - { name: summary, type: string, required: true }
+    wip: 4
+    inputs: [tests.diff, implementation.diff, review.json]
+    outputs: [manual-test.json]
+    next: item_done
+    check:
+      kind: gate
+      class: hidden-impl-bug
+      critic:
+        role: Amy manual test
+        model: sonnet
+      on_reject: coding
+      rework_cap: 4
+      progress_signal: findings_hash
+
+  # Parent mission resumes here after all spawned item lanes reach item_done.
+  - id: join
+    worker:
+      kind: deterministic
+      role: join all item lanes
+      command: "true"
+    wip: 1
+    inputs: [manual-test.json]
+    outputs: [mission-ready.json]
+    fan_in:
+      policy: all
+    next: final
+
+  # Stockwell final review can reject named items back into the ready pipeline.
+  - id: final
+    worker:
+      kind: agentic
+      role: Stockwell final reviewer
+      model: opus
+      prompt_file: prompts/aiteam.md
+      prompt_version: "1"
+      output_schema:
+        fields:
+          - { name: summary, type: string, required: true }
+    wip: 1
+    inputs: [mission-ready.json]
+    outputs: [final-review.md]
+    next: checks
+    check:
+      kind: gate
+      class: mission-quality
+      critic:
+        role: Stockwell
+        model: opus
+      on_reject: dispatch
+      rework_cap: 2
+      progress_signal: findings_hash
+
+  - id: checks
+    worker:
+      kind: deterministic
+      role: lint unit e2e
+      command: "true"
+    wip: 1
+    inputs: [final-review.md]
+    outputs: [post-checks.json]
+    next: docs
+
+  - id: docs
+    worker:
+      kind: agentic
+      role: Tawnia docs and commit
+      model: sonnet
+      prompt_file: prompts/aiteam.md
+      prompt_version: "1"
+      output_schema:
+        fields:
+          - { name: summary, type: string, required: true }
+    effectful: true
+    wip: 1
+    inputs: [final-review.md, post-checks.json]
+    outputs: [commit.txt]
+    next: done
+
+channels:
+  ingress:
+    type: cli
+  egress:
+    - type: terminal
+      target: stdout
+      uses: [status, alerts]
+    - type: operator
+      target: human
+      uses: [hitl, alerts]
+      hold_timeout_seconds: 1800
+      on_timeout: escalate
+
+security:
+  bash:
+    allow: ["true"]
+    deny_shell_metachars: true
+  network_egress: deny

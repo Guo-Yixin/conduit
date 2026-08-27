@@ -1,0 +1,80 @@
+# flow-kernel-demo.yaml — proves fan-out / fan-in + WIP cap with ZERO model calls.
+#
+# Replaces the LLM plan step with a deterministic script (gen-plan.sh) and
+# the ideate transform with a no-op (`true`), so the kernel machinery runs
+# completely without hitting the model gateway.  Run with --concurrency 5 to
+# see the WIP cap in effect.
+
+flow: tiktok-parallel-ideas-kernel-demo
+project_root: .
+flow_version: 1
+
+budgets:
+  run:
+    wall_clock_minutes: 5
+    max_tokens: 1000000
+  per_card:
+    max_execution_attempts: 2
+  liveness:
+    no_progress_minutes: 2
+
+defaults:
+  cap_policy: scrap
+  on_dep_scrap: hold
+
+terminal_lanes: [done, scrap, hold]
+
+stations:
+  - id: select
+    worker:
+      kind: deterministic
+      role: selector
+      command: duckdb
+      args: ["-readonly", "fixtures/fixture.duckdb", "-f", "select.sql"]
+    inputs: [request.json]
+    outputs: [selected.json]
+    next: plan
+
+  - id: plan
+    worker:
+      kind: deterministic
+      role: planner
+      command: bash
+      args: ["gen-plan.sh"]
+    inputs: [selected.json]
+    outputs: [plan.json]
+    fan_out: 10
+    child_entry: ideate
+    child_terminal: done
+    resume_at: collect
+    next: collect
+
+  - id: ideate
+    worker:
+      kind: deterministic
+      role: creative-strategist
+      command: "true"
+    inputs: []
+    outputs: []
+    next: done
+
+  - id: collect
+    worker:
+      kind: deterministic
+      role: assembler
+      command: "true"
+    inputs: []
+    outputs: []
+    fan_in:
+      policy: all
+    next: done
+
+channels:
+  ingress:
+    type: cli
+
+security:
+  bash:
+    allow: ["duckdb", "bash", "true", "python3"]
+    deny_shell_metachars: true
+  network_egress: allow

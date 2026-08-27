@@ -1,0 +1,80 @@
+# tiktok-shoppable-ideas — the dogfood flow for the real-run path.
+#
+# Linear, gated:  fetch_context (deterministic, DuckDB) -> ideate (transform) -> [gate verify] -> done
+#   * gate reject loops back to ideate (bounded rework)
+#
+# Runs against the committed synthetic fixture out of the box (fixtures/fixture.duckdb).
+# Point `args` at the real arcane.duckdb (and edit request.json) to run on real data.
+
+flow: tiktok-shoppable-ideas
+project_root: .
+flow_version: 1
+
+budgets:
+  run:
+    wall_clock_minutes: 10
+    max_tokens: 100000
+  per_card:
+    max_execution_attempts: 4
+  liveness:
+    no_progress_minutes: 3
+
+defaults:
+  cap_policy: scrap
+  on_dep_scrap: hold
+
+terminal_lanes: [done, scrap, hold]
+
+stations:
+  # 1. Gather sales + ad + hooks + recent-video + clock data into one context.json.
+  #    DuckDB CLI invoked with metacharacter-free args (passes the Law-lite allowlist; no wrapper).
+  - id: fetch_context
+    worker:
+      kind: deterministic
+      role: fetcher
+      command: duckdb
+      args: ["-readonly", "fixtures/fixture.duckdb", "-f", "fetch.sql"]
+    inputs: [request.json]
+    outputs: [context.json]
+    next: ideate
+
+  # 2. Turn context.json into ONE filming-idea paragraph featuring a specific colorway.
+  - id: ideate
+    worker:
+      kind: transform
+      role: creative-strategist
+      model: gemini-flash-lite-latest
+      prompt_file: prompts/ideate.md      # rendered against this station's inputs (context.json)
+      prompt_version: "1"
+      params:
+        temperature: 0.7
+      output_schema:
+        fields:
+          - { name: featured_variant, type: string, required: true }
+          - { name: hook,             type: string, required: true }
+          - { name: filming_idea,     type: string, required: true }
+    inputs: [context.json, feedback]
+    outputs: [idea.json]
+    next: done
+    # 3. A second, stronger critic verifies the idea is grounded + non-repeat; reject -> rework.
+    check:
+      kind: gate
+      class: taste
+      critic:
+        role: ad-critic
+        model: gpt-4o
+        prompt_file: prompts/verify.md    # rendered against idea.json + context.json
+        prompt_version: "1"
+      on_reject: ideate
+      rework_cap: 2
+      progress_signal: findings_hash
+
+channels:
+  ingress:
+    type: cli
+
+security:
+  bash:
+    allow: ["duckdb"]          # the only executable fetch_context may spawn
+    deny_shell_metachars: true
+  network_egress: allow         # model calls need outbound; DuckDB fixture stays local

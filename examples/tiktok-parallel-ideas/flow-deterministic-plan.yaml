@@ -1,0 +1,129 @@
+# flow-deterministic-plan.yaml — the tiktok-parallel-ideas flow with a
+# DETERMINISTIC fan-out parent instead of an LLM transform.
+#
+#   select (deterministic, DuckDB)         pick top-5 + bottom-5 by sales velocity
+#     -> plan (deterministic, FAN-OUT N=10)  gen-plan.sh emits one child lane per product
+#          └─ child: ideate (transform + gate) -> done     the normal ideation, per product
+#     -> collect (deterministic, FAN-IN: all)  gather the 10 ideas
+#       -> done
+#
+# Identical topology to flow.yaml; the only change is the `plan` station.
+# Mapping selected.json -> one child lane per product is mechanical (no
+# judgment), so it runs as a script (gen-plan.sh), not an LLM. The output is
+# byte-identical to the transform contract in prompts/plan.md, with no model
+# call, token spend, or parse-miss/hallucination surface per batch.
+#
+# Compare with the siblings:
+#   flow.yaml             — LLM `transform` plan (shows the fan-out parent contract)
+#   flow-kernel-demo.yaml — deterministic plan AND no-op ideate (zero model calls)
+# This variant sits between them: deterministic plan, REAL ideation + gate.
+# It is the shape you want in production when the fan-out is a pure mapping —
+# spend model tokens on judgment (ideate/verify), not on plumbing.
+
+flow: tiktok-parallel-ideas-det-plan
+project_root: .
+flow_version: 1
+
+budgets:
+  run:
+    wall_clock_minutes: 20
+    max_tokens: 400000
+  per_card:
+    max_execution_attempts: 4
+  # Per-wave (subtree) cap: the 10-lane batch is ONE parent_id subtree, so a
+  # runaway batch is scrapped without halting the whole run (SPEC §6/§8).
+  per_wave:
+    max_tokens: 120000
+  liveness:
+    no_progress_minutes: 3
+
+defaults:
+  cap_policy: scrap
+  on_dep_scrap: hold
+  # Each lane owns a disjoint output dir (ideas/<product>/); enforce it so one
+  # product's lane physically cannot stomp another's output.
+  enforce_owned_paths: true
+
+terminal_lanes: [done, scrap, hold]
+
+stations:
+  # 1. Rank products by recent sales velocity and select the top-5 + bottom-5.
+  #    Deterministic — selection is a query, not a judgment call.
+  - id: select
+    worker:
+      kind: deterministic
+      role: selector
+      command: duckdb
+      args: ["-readonly", "fixtures/fixture.duckdb", "-f", "select.sql"]
+    inputs: [request.json]
+    outputs: [selected.json]
+    next: plan
+
+  # 2. Fan-out parent: turn the N selected products into N child lanes.
+  #    Deterministic — see the header; this is the station that differs from
+  #    flow.yaml.
+  - id: plan
+    worker:
+      kind: deterministic
+      role: planner
+      command: bash
+      args: ["gen-plan.sh"]
+    inputs: [selected.json]
+    outputs: [plan.json]
+    fan_out: 10
+    child_entry: ideate
+    child_terminal: done
+    resume_at: collect
+    next: collect
+
+  # 3. Child sub-path: the normal ideation, gated — runs once per product lane.
+  - id: ideate
+    worker:
+      kind: transform
+      role: creative-strategist
+      model: gemini-flash-lite-latest
+      prompt_file: prompts/ideate.md
+      prompt_version: "1"
+      params:
+        temperature: 0.7
+      output_schema:
+        fields:
+          - { name: featured_variant, type: string, required: true }
+          - { name: hook,             type: string, required: true }
+          - { name: filming_idea,     type: string, required: true }
+    inputs: [context.json, feedback]
+    outputs: [idea.json]
+    next: done
+    check:
+      kind: gate
+      class: taste
+      critic:
+        role: ad-critic
+        model: gpt-4o
+        prompt_file: prompts/verify.md
+        prompt_version: "1"
+      on_reject: ideate
+      rework_cap: 2
+      progress_signal: findings_hash
+
+  # 4. Fan-in: wait for ALL lanes, then assemble the batch of ideas.
+  - id: collect
+    worker:
+      kind: deterministic
+      role: assembler
+      command: "true"
+    inputs: []
+    outputs: []
+    fan_in:
+      policy: all
+    next: done
+
+channels:
+  ingress:
+    type: cli
+
+security:
+  bash:
+    allow: ["duckdb", "bash", "true", "python3"]   # gen-plan.sh shells bash -> python3
+    deny_shell_metachars: true
+  network_egress: allow

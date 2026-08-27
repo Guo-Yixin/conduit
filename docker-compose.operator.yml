@@ -1,0 +1,71 @@
+# docker-compose.operator.yml — reference operator stack (WI-440, FR-10/FR-12b)
+#
+# Topology:
+#   listener  — long-lived per-flow container running the `listen` subcommand.
+#               Receives webhook events and enqueues cards into the shared
+#               conduit.sqlite state DB (FR-10).
+#   kernel    — per-run per-flow container executing `run` against the baked flow.
+#               Shares the same conduit.sqlite volume as the listener so both
+#               read/write the same state (FR-10 shared state, FR-6).
+#   model     — local model sidecar endpoint (Ollama); both engine services
+#               reach it via CONDUIT_BASE_URL — no model baked in (FR-9).
+#
+# Secrets: never baked in — export env vars in the shell or use a .env file (FR-5).
+# Build the referenced per-flow image first, e.g. `branching-flow` from
+# docs/installation.md. Override with CONDUIT_FLOW_IMAGE=my-flow:tag.
+# The ENTRYPOINT in the flow image is inherited from conduit-engine:
+# `bun src/cli/main.ts`; compose `command:` forwards the subcommand.
+
+services:
+  listener:
+    image: ${CONDUIT_FLOW_IMAGE:-branching-flow}
+    # Forwards the `listen` subcommand to the inherited engine ENTRYPOINT (FR-10).
+    command: ["listen", "--flows", "branching=/flow/flow.yaml", "--port", "8080"]
+    ports:
+      # Webhook ingress port; reverse-proxy or cloud load-balancer terminates TLS.
+      - "8080:8080"
+    volumes:
+      # Shared named state volume — conduit.sqlite lives here (FR-6)
+      - conduit_data:/data
+    environment:
+      # Model gateway endpoint — same sidecar as the kernel (FR-9)
+      CONDUIT_BASE_URL: http://model:11434/v1
+      # Secrets interpolated from host shell / .env file — never baked in (FR-5)
+      CONDUIT_API_KEY: ${CONDUIT_API_KEY:-}
+      CONDUIT_SLACK_SIGNING_SECRET: ${CONDUIT_SLACK_SIGNING_SECRET:-}
+    depends_on:
+      - model
+    restart: unless-stopped
+
+  kernel:
+    image: ${CONDUIT_FLOW_IMAGE:-branching-flow}
+    profiles: ["run"]
+    # One-shot run against the baked flow. Invoke with:
+    #   docker compose -f docker-compose.operator.yml run --rm kernel
+    command: ["run", "/flow/flow.yaml"]
+    volumes:
+      # Same named state volume as the listener — shared conduit.sqlite (FR-10)
+      - conduit_data:/data
+    environment:
+      # Model gateway endpoint — must match the listener's sidecar (FR-9)
+      CONDUIT_BASE_URL: http://model:11434/v1
+      # Secrets interpolated from host shell / .env file — never baked in (FR-5)
+      CONDUIT_API_KEY: ${CONDUIT_API_KEY:-}
+    depends_on:
+      - model
+
+  model:
+    # Local Ollama inference server — acts as the model gateway endpoint for both
+    # engine services. Swap for LiteLLM, vLLM, or any OpenAI-compatible proxy.
+    image: ollama/ollama
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama_models:/root/.ollama
+    restart: unless-stopped
+
+volumes:
+  # Shared named volume: conduit.sqlite + WAL files for listener + kernel (FR-6)
+  conduit_data:
+  # Named volume for Ollama model weights (survives container restarts)
+  ollama_models:

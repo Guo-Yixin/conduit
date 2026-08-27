@@ -1,0 +1,56 @@
+# LiteLLM gateway config for the tiktok-shoppable-ideas example.
+#
+# One OpenAI-compatible endpoint that routes each station's `model:` string (from
+# flow.yaml) to a DIFFERENT upstream provider — the whole point of a gateway:
+# per-station model selection with no kernel/flow change.
+#
+#   ideate (maker)   model: gemini-flash-lite-latest  ->  Google (Gemini)
+#   gate   (critic)  model: gpt-4o                     ->  OpenAI
+#
+# The model_name on the left MUST match the flow.yaml `model:` value; LiteLLM
+# resolves it to the litellm_params below. Conduit just speaks OpenAI to the
+# proxy and never routes per-model itself.
+#
+# Run:
+#   export GEMINI_OPENAI_KEY=...      # the Google key (Bearer, OpenAI-compat path)
+#   export OPENAI_API_KEY=sk-...      # your OpenAI key (for the gpt-4o critic)
+#   litellm --config litellm.config.yaml --port 4000
+# Then point Conduit at it:
+#   export CONDUIT_BASE_URL=http://localhost:4000
+#   export CONDUIT_API_KEY=sk-conduit-local   # = master_key below
+#   conduit run flow.yaml --input request.json
+
+model_list:
+  # ── ideate (maker) → Google Gemini Flash Lite ──────────────────────────────
+  # Routed via Google's OpenAI-compatible endpoint (Bearer auth) using the
+  # `openai/` provider + a custom api_base — the same path Conduit used directly.
+  - model_name: gemini-flash-lite-latest
+    litellm_params:
+      model: openai/gemini-flash-lite-latest
+      api_base: https://generativelanguage.googleapis.com/v1beta/openai
+      api_key: os.environ/GEMINI_OPENAI_KEY
+
+  # ── gate critic (inspector) → OpenAI GPT-4o ────────────────────────────────
+  # A different provider entirely — proves multi-provider routing behind one URL.
+  - model_name: gpt-4o
+    litellm_params:
+      model: openai/gpt-4o
+      api_key: os.environ/OPENAI_API_KEY
+
+  # ── OPTIONAL: a local maker via Ollama (zero cloud cost) ────────────────────
+  # To run ideate locally instead, set the flow's ideate `model:` to
+  # `ideate-local` and start Ollama (`ollama serve`; `ollama pull qwen2.5:7b`).
+  - model_name: ideate-local
+    litellm_params:
+      model: ollama_chat/qwen2.5:7b
+      api_base: http://localhost:11434
+
+litellm_settings:
+  # Conduit forwards inference params (temperature, etc.); silently drop any a
+  # given provider doesn't support instead of erroring the call.
+  drop_params: true
+
+general_settings:
+  # Require this key on the proxy; Conduit sends it as CONDUIT_API_KEY. Change it
+  # (or remove this block to run the proxy keyless on a trusted local socket).
+  master_key: sk-conduit-local

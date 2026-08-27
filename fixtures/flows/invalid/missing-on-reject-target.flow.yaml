@@ -1,0 +1,61 @@
+# Invalid fixture: missing-on-reject-target (WI-291)
+#
+# Defect: the gate check on station 'write' declares
+#   on_reject: ghost_station
+# but 'ghost_station' is not defined anywhere in the stations list.
+#
+# Result: the validator cannot build a legal lane graph because the
+# back-edge target does not exist. It must reject this config at load
+# with a "unknown on_reject target 'ghost_station'" error.
+#
+# This file is syntactically valid YAML; the error is semantic.
+
+flow: missing-reject-target-example
+project_root: ./workspace
+flow_version: 1
+
+budgets:
+  run:
+    wall_clock_minutes: 10
+    max_tokens: 100000
+  per_card:
+    max_execution_attempts: 3
+  liveness:
+    no_progress_minutes: 5
+
+defaults:
+  cap_policy: scrap
+  on_dep_scrap: hold
+
+terminal_lanes: [done, scrap, hold]
+
+stations:
+  - id: write
+    worker:
+      kind: transform
+      role: writer
+      model: gpt-4o-mini
+    wip: 5
+    inputs: [request.json]
+    outputs: [draft.md]
+    check:
+      kind: gate
+      class: taste
+      critic:
+        role: critic
+        model: gpt-4o-mini
+      on_reject: ghost_station  # ERROR: 'ghost_station' does not exist
+      rework_cap: 3
+      progress_signal: findings_hash
+
+  - id: publish
+    worker:
+      kind: deterministic
+      role: publisher
+    wip: 3
+    inputs: [draft.md]
+    outputs: [final.md]
+
+channels:
+  ingress:
+    type: cli

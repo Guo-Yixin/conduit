@@ -1,0 +1,9 @@
+{
+  "product_id": "999000111222333444",
+  "sales_name_like": "%Galaxy Mug Buddy%",
+  "lookback_days": 60,
+  "recent_days": 4,
+  "recent_video_days": 14,
+  "active_campaigns": ["Spring Mugs"],
+  "creative_brief": ""
+}

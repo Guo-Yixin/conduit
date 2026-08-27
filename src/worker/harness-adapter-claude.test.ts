@@ -1,0 +1,324 @@
+/**
+ * claude-headless harness adapter contract (WI-564).
+ *
+ * The first shipping real HarnessAdapter (WI-560). It builds a `claude -p`
+ * invocation from its engine-config definition, spawns it through the bounded
+ * process runner (WI-561) with the env allowlist (WI-562), parses the harness's
+ * STRUCTURED JSON usage/cost (never scraped from free text), and translates the
+ * station's declared tools allowlist into claude's `--allowed-tools` flag.
+ *
+ * Contract-test discipline (PRD Technical Considerations §9 / risk row "output
+ * drift"): the adapter is driven against a RECORDED `claude -p --output-format
+ * json` payload via an INJECTED runner seam — no live network, no real process.
+ * The runner seam (default: runHarnessProcess) lets the test both feed recorded
+ * stdout AND assert the exact command/args/runner-config the adapter built.
+ *
+ * Contract decisions this file pins:
+ *   - createClaudeHarnessAdapter(config) returns a HarnessAdapter with
+ *     name='claude-headless', reportsUsage=true, canRestrictTools=true, and an
+ *     injected `run` seam + `probe` seam.
+ *   - invoke() builds:  ['-p','--output-format','json', (--model M)?,
+ *       (--allowed-tools <csv>)?, '--', <prompt>]  — the `--` terminates option
+ *     parsing so the variadic --allowed-tools cannot swallow the prompt.
+ *   - --allowed-tools is added IFF call.tools is non-empty; an empty tools list
+ *     (the executor's encoding of a waived `unrestricted_tools: true` station)
+ *     passes through with NO narrowing flag.
+ *   - usage.tokens = sum of the four disjoint usage counters (input/output/
+ *     cache_creation/cache_read, absent → 0); usage.cost = total_cost_usd.
+ *   - a malformed/unexpected/errored/timed-out payload REJECTS with a named
+ *     ('claude-headless') error — never a silent zero-usage success.
+ *   - outputs is []: the executor collects declared outputs from DISK
+ *     (executor.ts findMissingDeclaredOutputs), and the claude JSON carries no
+ *     file manifest, so the adapter never fabricates output references.
+ */
+import { describe, it, expect } from 'bun:test';
+import {
+  createClaudeHarnessAdapter,
+  type ClaudeHarnessAdapterConfig,
+} from './harness-adapter-claude';
+import type {
+  HarnessCommand,
+  HarnessRunnerConfig,
+  HarnessSpawnResult,
+} from './harness-runner';
+import type { HarnessAdapter, HarnessInvocation, BinaryProbe } from './harness-adapter';
+
+// ---------------------------------------------------------------------------
+// Recorded `claude -p --output-format json` payloads (no live network).
+// ---------------------------------------------------------------------------
+
+/** A realistic success envelope, cache counters zero (tokens = input+output). */
+const RECORDED_SUCCESS = JSON.stringify({
+  type: 'result',
+  subtype: 'success',
+  is_error: false,
+  duration_ms: 5321,
+  num_turns: 3,
+  result: 'Implemented the task and wrote result.md.',
+  session_id: '2f7c8b1e-uuid',
+  total_cost_usd: 0.0123,
+  usage: {
+    input_tokens: 1000,
+    output_tokens: 500,
+    cache_creation_input_tokens: 0,
+    cache_read_input_tokens: 0,
+  },
+});
+
+/** A success envelope exercising the cache counters (tokens sums all four). */
+const RECORDED_SUCCESS_CACHED = JSON.stringify({
+  type: 'result',
+  subtype: 'success',
+  is_error: false,
+  result: 'done',
+  total_cost_usd: 0.05,
+  usage: {
+    input_tokens: 1000,
+    output_tokens: 500,
+    cache_creation_input_tokens: 300,
+    cache_read_input_tokens: 200,
+  },
+});
+
+// ---------------------------------------------------------------------------
+// Injected runner seam — records the (cmd, config) the adapter built and
+// returns a scripted spawn result. Mirrors makeStubAdapter (transform.test.ts).
+// ---------------------------------------------------------------------------
+
+interface RunnerCall {
+  cmd: HarnessCommand;
+  config: HarnessRunnerConfig;
+}
+
+function makeRun(
+  spawn: Partial<HarnessSpawnResult> & { stdout: string },
+): { run: ClaudeHarnessAdapterConfig['run']; calls: RunnerCall[] } {
+  const calls: RunnerCall[] = [];
+  const run = async (cmd: HarnessCommand, config: HarnessRunnerConfig): Promise<HarnessSpawnResult> => {
+    calls.push({ cmd, config });
+    return {
+      exitCode: 0,
+      stderr: '',
+      durationMs: 5321,
+      timedOut: false,
+      ...spawn,
+    };
+  };
+  return { run, calls };
+}
+
+const PROJECT_ROOT = '/work/project';
+const ENV_ALLOWLIST = ['ANTHROPIC_API_KEY', 'PATH'];
+
+function makeAdapter(
+  over: Partial<ClaudeHarnessAdapterConfig> & { run: ClaudeHarnessAdapterConfig['run'] },
+): HarnessAdapter {
+  return createClaudeHarnessAdapter({
+    projectRoot: PROJECT_ROOT,
+    envAllowlist: ENV_ALLOWLIST,
+    ...over,
+  });
+}
+
+function invocation(over: Partial<HarnessInvocation> = {}): HarnessInvocation {
+  return {
+    prompt: 'Implement the task described in task.md',
+    inputs: [{ name: 'task.md', path: '/work/project/task.md' }],
+    tools: ['Read', 'Write', 'Bash'],
+    timeoutMs: 120_000,
+    ...over,
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Static capabilities.
+// ---------------------------------------------------------------------------
+
+describe('claude-headless adapter: identity + static capabilities', () => {
+  it('is named claude-headless and reports usage + tool-restriction capability', () => {
+    const adapter = makeAdapter({ run: makeRun({ stdout: RECORDED_SUCCESS }).run });
+    expect(adapter.name).toBe('claude-headless');
+    expect(adapter.reportsUsage).toBe(true);
+    expect(adapter.canRestrictTools).toBe(true);
+  });
+
+  it('probes binary presence via the injected probe seam without invoking', async () => {
+    const present = makeAdapter({
+      run: makeRun({ stdout: RECORDED_SUCCESS }).run,
+      probe: async (): Promise<BinaryProbe> => ({ present: true, detail: '/usr/local/bin/claude' }),
+    });
+    expect((await present.probeBinary()).present).toBe(true);
+
+    const missing = makeAdapter({
+      run: makeRun({ stdout: RECORDED_SUCCESS }).run,
+      probe: async (): Promise<BinaryProbe> => ({ present: false, detail: 'claude not found' }),
+    });
+    expect((await missing.probeBinary()).present).toBe(false);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// AC1 — builds the claude -p invocation and runs it through the runner with the
+// env allowlist applied.
+// ---------------------------------------------------------------------------
+
+describe('claude-headless adapter: invocation building (AC1)', () => {
+  it('spawns `claude -p --output-format json` with the prompt as a terminated positional', async () => {
+    const { run, calls } = makeRun({ stdout: RECORDED_SUCCESS });
+    const adapter = makeAdapter({ run });
+
+    await adapter.invoke(invocation({ prompt: 'do the work' }));
+
+    expect(calls).toHaveLength(1);
+    const { cmd } = calls[0]!;
+    expect(cmd.command).toBe('claude');
+    // Structured print mode.
+    expect(cmd.args.slice(0, 3)).toEqual(['-p', '--output-format', 'json']);
+    // The prompt is the final positional, guarded by a `--` option terminator so
+    // the variadic --allowed-tools cannot consume it.
+    expect(cmd.args).toContain('--');
+    expect(cmd.args[cmd.args.length - 1]).toBe('do the work');
+  });
+
+  it('runs through the process runner with the project root, timeout, and env allowlist applied', async () => {
+    const { run, calls } = makeRun({ stdout: RECORDED_SUCCESS });
+    const adapter = makeAdapter({ run });
+
+    await adapter.invoke(invocation({ timeoutMs: 90_000 }));
+
+    const { config } = calls[0]!;
+    expect(config.projectRoot).toBe(PROJECT_ROOT);
+    expect(config.timeoutMs).toBe(90_000);
+    // NFR-Security-2: only engine-config-allowlisted names reach the child.
+    expect(config.envAllowlist).toEqual(ENV_ALLOWLIST);
+  });
+
+  it('passes the configured binary command through to the runner', async () => {
+    const { run, calls } = makeRun({ stdout: RECORDED_SUCCESS });
+    const adapter = makeAdapter({ run, command: '/opt/claude/bin/claude' });
+
+    await adapter.invoke(invocation());
+
+    expect(calls[0]!.cmd.command).toBe('/opt/claude/bin/claude');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// AC2 — usage parsed from the STRUCTURED payload; outputs collected elsewhere.
+// ---------------------------------------------------------------------------
+
+describe('claude-headless adapter: structured usage parsing (AC2)', () => {
+  it('reads tokens (input+output) and cost from total_cost_usd', async () => {
+    const adapter = makeAdapter({ run: makeRun({ stdout: RECORDED_SUCCESS }).run });
+
+    const result = await adapter.invoke(invocation());
+
+    // Not scraped from free text — parsed from the JSON usage object.
+    expect(result.usage).toEqual({ tokens: 1500, cost: 0.0123 });
+  });
+
+  it('sums all four disjoint usage counters (input+output+cache_creation+cache_read)', async () => {
+    const adapter = makeAdapter({ run: makeRun({ stdout: RECORDED_SUCCESS_CACHED }).run });
+
+    const result = await adapter.invoke(invocation());
+
+    expect(result.usage).toEqual({ tokens: 2000, cost: 0.05 });
+  });
+
+  it('treats absent usage subfields as zero (older payloads with only input/output)', async () => {
+    const stdout = JSON.stringify({
+      type: 'result',
+      subtype: 'success',
+      is_error: false,
+      result: 'ok',
+      total_cost_usd: 0.002,
+      usage: { input_tokens: 40, output_tokens: 10 },
+    });
+    const adapter = makeAdapter({ run: makeRun({ stdout }).run });
+
+    const result = await adapter.invoke(invocation());
+
+    expect(result.usage).toEqual({ tokens: 50, cost: 0.002 });
+  });
+
+  it('returns no fabricated output references (declared outputs are collected from disk by the executor)', async () => {
+    const adapter = makeAdapter({ run: makeRun({ stdout: RECORDED_SUCCESS }).run });
+
+    const result = await adapter.invoke(invocation());
+
+    expect(result.outputs).toEqual([]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// AC3 — tools allowlist → claude --allowed-tools; waiver passes through.
+// ---------------------------------------------------------------------------
+
+describe('claude-headless adapter: tools narrowing (AC3)', () => {
+  it('translates a declared tools allowlist into a single --allowed-tools flag', async () => {
+    const { run, calls } = makeRun({ stdout: RECORDED_SUCCESS });
+    const adapter = makeAdapter({ run });
+
+    await adapter.invoke(invocation({ tools: ['Read', 'Write', 'Bash'] }));
+
+    const { args } = calls[0]!.cmd;
+    const idx = args.indexOf('--allowed-tools');
+    expect(idx).toBeGreaterThanOrEqual(0);
+    // Comma-joined single value (claude accepts comma- or space-separated).
+    expect(args[idx + 1]).toBe('Read,Write,Bash');
+  });
+
+  it('adds NO narrowing flag when the tools list is empty (unrestricted_tools waiver passthrough)', async () => {
+    const { run, calls } = makeRun({ stdout: RECORDED_SUCCESS });
+    const adapter = makeAdapter({ run });
+
+    await adapter.invoke(invocation({ tools: [] }));
+
+    // The executor encodes a waived `unrestricted_tools: true` station as an empty
+    // tools list; the adapter must then pass through with full tool access.
+    expect(calls[0]!.cmd.args).not.toContain('--allowed-tools');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// AC4 — malformed / unexpected / errored / timed-out payloads REJECT with a
+// named error, never a silent zero-usage success.
+// ---------------------------------------------------------------------------
+
+describe('claude-headless adapter: named parse failures, never silent zero-usage (AC4)', () => {
+  it.each([
+    ['stdout is not JSON', { stdout: 'claude: fatal: not json {' }],
+    ['the usage object is absent', { stdout: JSON.stringify({ type: 'result', subtype: 'success', is_error: false, result: 'x', total_cost_usd: 0.1 }) }],
+    // A PRESENT-but-malformed usage must not crash with an unguarded TypeError
+    // (`typeof null === 'object'` / array indexing) — it must reject like every
+    // other AC4 row, never a silent tokens=0 "success" (Lynch/Amy regression).
+    ['usage is null', { stdout: JSON.stringify({ type: 'result', subtype: 'success', is_error: false, result: 'x', total_cost_usd: 0.1, usage: null }) }],
+    ['usage is a string', { stdout: JSON.stringify({ type: 'result', subtype: 'success', is_error: false, result: 'x', total_cost_usd: 0.1, usage: 'a string' }) }],
+    ['usage is an array', { stdout: JSON.stringify({ type: 'result', subtype: 'success', is_error: false, result: 'x', total_cost_usd: 0.1, usage: [] }) }],
+    ['total_cost_usd is absent', { stdout: JSON.stringify({ type: 'result', subtype: 'success', is_error: false, result: 'x', usage: { input_tokens: 1, output_tokens: 1 } }) }],
+    ['total_cost_usd is non-numeric', { stdout: JSON.stringify({ type: 'result', subtype: 'success', is_error: false, result: 'x', total_cost_usd: 'free', usage: { input_tokens: 1, output_tokens: 1 } }) }],
+    ['the harness reports is_error', { stdout: JSON.stringify({ type: 'result', subtype: 'error_during_execution', is_error: true, result: 'boom', total_cost_usd: 0.1, usage: { input_tokens: 1, output_tokens: 1 } }) }],
+  ])('rejects when %s — a named claude-headless error', async (_label, spawn) => {
+    const adapter = makeAdapter({ run: makeRun(spawn).run });
+
+    // Never resolves to a zero-usage success — it rejects, and the executor's
+    // invoke() try/catch escalates the card to hold.
+    await expect(adapter.invoke(invocation())).rejects.toThrow(/claude-headless/i);
+  });
+
+  it('rejects when the process timed out (a killed attempt is not a zero-usage success)', async () => {
+    const adapter = makeAdapter({
+      run: makeRun({ stdout: '', timedOut: true, exitCode: 137 }).run,
+    });
+
+    await expect(adapter.invoke(invocation())).rejects.toThrow(/claude-headless/i);
+  });
+
+  it('rejects on a non-zero exit code even when stdout is empty', async () => {
+    const adapter = makeAdapter({
+      run: makeRun({ stdout: '', exitCode: 1, stderr: 'auth error' }).run,
+    });
+
+    await expect(adapter.invoke(invocation())).rejects.toThrow(/claude-headless/i);
+  });
+});
