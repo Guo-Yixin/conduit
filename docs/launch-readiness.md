@@ -45,8 +45,8 @@ safe for outside contributors. Product sequencing lives in
 - [x] Verify tests and typechecking pass in the public GitHub Actions context.
 - [ ] Confirm issue and pull-request templates contain no private workflow
   assumptions.
-- [ ] Publish the first public version tag and release notes.
-- [ ] Publish the corresponding Docker engine image and document its immutable
+- [x] Publish the first public version tag and release notes.
+- [x] Publish the corresponding Docker engine image and document its immutable
   tag.
 - [ ] Exercise the security-reporting address and coordinated-disclosure path.
 
