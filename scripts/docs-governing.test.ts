@@ -7,7 +7,7 @@
  * blocks merges.
  */
 import { describe, it, expect } from 'bun:test';
-import { parseBindings, targetGoverns, docsGoverning } from './docs-governing';
+import { parseBindings, targetGoverns, docsGoverning, governedFiles } from './docs-governing';
 
 const LOCK = `
 version = 1
@@ -93,5 +93,30 @@ describe('docsGoverning', () => {
 
   it('is silent for no files at all', () => {
     expect(docsGoverning(bindings, [])).toEqual([]);
+  });
+});
+
+describe('governedFiles', () => {
+  const bindings = parseBindings(LOCK);
+
+  it('returns only the inputs some binding targets', () => {
+    expect(
+      governedFiles(bindings, ['src/quality/rework.ts', 'src/ingress/event-id.ts', 'src/law/contract.ts']),
+    ).toEqual(['src/quality/rework.ts', 'src/law/contract.ts']);
+  });
+
+  it('preserves input order rather than lockfile order', () => {
+    expect(governedFiles(bindings, ['src/law/contract.ts', 'src/quality/rework.ts'])).toEqual([
+      'src/law/contract.ts',
+      'src/quality/rework.ts',
+    ]);
+  });
+
+  it('is empty when nothing changed is bound — the fast path docs-check.sh takes', () => {
+    expect(governedFiles(bindings, ['src/ingress/event-id.ts', 'README.md'])).toEqual([]);
+  });
+
+  it('does not report a file that merely shares a prefix with a target', () => {
+    expect(governedFiles(bindings, ['src/law/contract.test.ts'])).toEqual([]);
   });
 });

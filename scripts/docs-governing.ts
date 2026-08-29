@@ -12,9 +12,12 @@
  * So we prefix-match the target column of drift.lock instead: any binding whose
  * target is the file itself or `<file>#Symbol` counts as governing that file.
  *
- * Usage:  bun scripts/docs-governing.ts <path> [<path>...]
- * Output: one governing doc path per line (deduped, sorted). Empty when the
- *         file is unbound — silence is the common case and costs nothing.
+ * Usage:  bun scripts/docs-governing.ts [--files] <path> [<path>...]
+ * Output: one governing doc path per line (deduped, sorted). With `--files`,
+ *         instead echoes back the subset of INPUT paths that any binding
+ *         targets — used by docs-check.sh to skip `drift check` entirely when a
+ *         change touches nothing bound. Both are empty for unbound input;
+ *         silence is the common case and costs nothing.
  * Exit:   always 0. This routes attention; it never gates. `drift check` gates.
  */
 import { readFileSync, existsSync } from 'node:fs';
@@ -77,14 +80,29 @@ export function docsGoverning(bindings: Binding[], files: string[]): string[] {
   return [...docs].sort();
 }
 
+/**
+ * The subset of `files` that some binding targets, in the order given.
+ *
+ * Shares `targetGoverns` with `docsGoverning` deliberately: the rule for "does
+ * this target belong to this file" — including the '#' guard that stops
+ * `contract.ts` matching `contract.test.ts` — is subtle enough that a second
+ * copy in shell would eventually disagree with this one.
+ */
+export function governedFiles(bindings: Binding[], files: string[]): string[] {
+  return files.filter((f) => bindings.some((b) => targetGoverns(b.target, f)));
+}
+
 /** Normalise to repo-relative POSIX paths so hook-supplied absolute paths match. */
 function toRepoRelative(p: string): string {
   return (isAbsolute(p) ? relative(process.cwd(), p) : p).replaceAll('\\', '/');
 }
 
 if (import.meta.main) {
-  const files = process.argv.slice(2).map(toRepoRelative);
+  const argv = process.argv.slice(2);
+  const wantFiles = argv[0] === '--files';
+  const files = (wantFiles ? argv.slice(1) : argv).map(toRepoRelative);
   if (files.length === 0 || !existsSync(LOCKFILE)) process.exit(0);
-  const docs = docsGoverning(parseBindings(readFileSync(LOCKFILE, 'utf-8')), files);
-  if (docs.length > 0) console.log(docs.join('\n'));
+  const bindings = parseBindings(readFileSync(LOCKFILE, 'utf-8'));
+  const out = wantFiles ? governedFiles(bindings, files) : docsGoverning(bindings, files);
+  if (out.length > 0) console.log(out.join('\n'));
 }

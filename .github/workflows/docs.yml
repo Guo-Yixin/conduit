@@ -50,8 +50,35 @@ jobs:
         with:
           version: v0.10.1
 
-      - name: Check documentation freshness
-        run: drift check
+      # The BACKSTOP. Runs the byte-for-byte same script as .githooks/pre-commit,
+      # over the files this PR changed rather than the files a commit staged, so
+      # a change that bypassed the hook (--no-verify, or a contributor who never
+      # installed drift) still gets the same verdict here.
+      - name: Check documentation freshness (same check as the pre-commit hook)
+        env:
+          BASE_SHA: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || github.event.before }}
+        run: |
+          set -eu
+          # A first push to a new branch reports an all-zero "before" SHA, and a
+          # force-push can leave a base that is no longer an ancestor. Fall back
+          # to the merge-base with the default branch, then to HEAD~1.
+          if [ -z "${BASE_SHA:-}" ] || [ "$BASE_SHA" = "0000000000000000000000000000000000000000" ] \
+             || ! git cat-file -e "$BASE_SHA^{commit}" 2>/dev/null; then
+            BASE_SHA=$(git merge-base origin/main HEAD 2>/dev/null || git rev-parse HEAD~1)
+          fi
+          echo "Comparing against $BASE_SHA"
+          changed=$(git diff --name-only --diff-filter=ACM "$BASE_SHA" HEAD)
+          [ -n "$changed" ] || { echo "no files changed"; exit 0; }
+          # shellcheck disable=SC2086
+          scripts/docs-check.sh $changed
+
+      # Informational only: surfaces anchors that were ALREADY stale on main
+      # before this PR. Never fails the job — this PR is not accountable for
+      # drift it did not introduce, which is exactly why the gate above is
+      # scoped. Use it to notice rot that slipped past the hook.
+      - name: Full corpus status (informational)
+        if: always()
+        run: drift check || true
 
       - name: Typecheck the docs tooling
         run: bun run typecheck:scripts
