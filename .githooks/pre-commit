@@ -1,0 +1,57 @@
+#!/bin/sh
+# Commit-level documentation reconciliation.
+#
+# WHY THE COMMIT, NOT THE EDIT: "is this prose still true?" is not answerable
+# while the code is still moving. Checking per-edit would ask the question
+# before the answer exists, and invite rewriting a SPEC paragraph three times
+# as one change settles. A commit is the first coherent unit where the question
+# has an answer. (Reading the docs BEFORE the work is a separate concern with a
+# different unit — once per task, see `docs:governing` in CLAUDE.md.)
+#
+# SCOPED TO STAGED FILES on purpose: `drift check` unscoped would fail this
+# commit for an anchor some EARLIER commit left stale, blocking work unrelated
+# to it. `--changed <path>` restricts to bindings whose target is that path, so
+# you are only ever accountable for what you actually touched.
+#
+# Install once:  git config core.hooksPath .githooks
+# Bypass:        git commit --no-verify      (CI's advisory `docs` job still runs)
+# Warn-only:     CONDUIT_DRIFT_ADVISORY=1 git commit
+set -eu
+
+command -v drift >/dev/null 2>&1 || exit 0   # not installed — never block a contributor
+
+staged=$(git diff --cached --name-only --diff-filter=ACM)
+[ -n "$staged" ] || exit 0
+
+# Fast path: if nothing staged is the target of a binding, there is nothing this
+# commit could have made stale. One process, and the overwhelmingly common case.
+# shellcheck disable=SC2086
+bun scripts/docs-governing.ts $staged >/dev/null 2>&1 || exit 0
+# shellcheck disable=SC2086
+[ -n "$(bun scripts/docs-governing.ts $staged 2>/dev/null)" ] || exit 0
+
+stale=0
+for f in $staged; do
+  drift check --changed "$f" --silent >/dev/null 2>&1 || { stale=1; drift check --changed "$f" 2>&1 | grep -E 'STALE|BROKEN' || true; }
+done
+[ "$stale" -eq 0 ] && exit 0
+
+cat >&2 <<'MSG'
+
+Documentation bound to code in this commit is now unvouched-for.
+
+This is an obligation, not an error: the code under those anchors changed, so
+nobody has confirmed the prose since. Re-read the section named above, then
+
+  - fix the prose if it is now wrong, and
+  - re-stamp the anchor:  drift link <doc> --doc-is-still-accurate
+
+`drift link` refuses to re-stamp without that flag. Passing it asserts you
+re-read the doc — do not pass it just to make this hook pass.
+
+  Bypass once:  git commit --no-verify
+  Warn only:    CONDUIT_DRIFT_ADVISORY=1 git commit
+MSG
+
+[ "${CONDUIT_DRIFT_ADVISORY:-0}" = "1" ] && { echo "(advisory mode — committing anyway)" >&2; exit 0; }
+exit 1

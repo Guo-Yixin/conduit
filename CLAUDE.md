@@ -122,23 +122,36 @@ the target at the moment someone last vouched for the prose. It is a routing
 table, not a correctness checker: it tells you *which paragraph to re-read*,
 never that a paragraph is right.
 
-**Before editing anything under `src/`:**
+Two obligations, at two different moments. They are separate on purpose — one is
+an input to the work, the other is only answerable once the work has settled.
+
+**Once, when you scope a task** — not per edit — name the files the task will
+touch:
 
 ```bash
-bun run docs:governing src/quality/rework.ts   # -> SPEC.md
+bun run docs:governing src/quality/rework.ts src/controller/gate-rework.ts
+# -> SPEC.md
 ```
 
 Anything it prints makes claims about the code you are about to change. **Read
-those sections first and implement against them.** Silence means the file is
-unbound and there is nothing to read — the common case, and it costs nothing.
-Do not skip this on the assumption that a change is small: issue #1 was a
-one-line cap comparison whose correct behaviour was specified in SPEC §6.
+those sections and implement against them.** Silence means nothing is bound and
+there is nothing to read — the common case, and it costs nothing. Do not skip
+this because a change looks small: issue #1 was a one-line cap comparison whose
+correct behaviour was specified in SPEC §6.
 
-**After changing code:**
+Run it once per task, not once per edit. Editing a file five times does not make
+SPEC §6 say anything new.
+
+**At commit time** — enforced by `.githooks/pre-commit`, scoped to staged files:
 
 ```bash
 bun run docs:check          # `drift check` — exits 1 on any stale anchor
 ```
+
+The commit is the unit here because "is this prose still true?" cannot be
+answered while the code is still moving; asking per-edit asks before the answer
+exists, and invites rewriting a SPEC paragraph three times as one change
+settles.
 
 A stale anchor is an obligation, not an error. Re-read the section it names,
 then either fix the prose or confirm it still holds:
@@ -148,9 +161,9 @@ drift link SPEC.md --doc-is-still-accurate
 ```
 
 `drift link` **refuses** to re-stamp a stale anchor without that flag. Passing it
-is an assertion that you re-read the doc. Do not pass it to make CI green — a
-`drift.lock` diff that re-signs anchors while changing no prose is exactly what
-reviewers look for.
+is an assertion that you re-read the doc. Do not pass it to make the hook or CI
+pass — a `drift.lock` diff that re-signs anchors while changing no prose is
+exactly what reviewers look for.
 
 **When adding or renaming a governed symbol**, update the binding
 (`drift link <doc> <file#Symbol>` / `drift unlink`) in the same change.
