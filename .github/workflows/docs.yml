@@ -1,0 +1,60 @@
+# Documentation freshness — advisory, NOT a required check.
+#
+# `drift check` verifies that every binding in drift.lock still matches its
+# target's AST fingerprint. A stale anchor means the code a doc describes moved
+# without anyone re-reading the doc — it does NOT mean the doc is wrong, only
+# that nobody has vouched for it since the change.
+#
+# This is the BACKSTOP, not the mechanism. The intended enforcement point is the
+# agent/developer workflow (scripts/docs-governing.ts before an edit, `drift
+# check` after); this job catches the change that skipped both.
+#
+# Job name is `docs`, never `tests` — branch protection targets the `tests` job
+# in test.yml by name, and reusing it would fold this advisory job into the
+# required gate (the same constraint blackbox.yml documents).
+#
+# Burn-in-then-promote, matching blackbox.yml: run advisory-only for roughly
+# 2 weeks / ~50 PRs, including at least ONE drift version bump, before
+# considering promotion to a required check. The version bump matters more here
+# than elsewhere: `sig` is an AST fingerprint, so if drift changes how it
+# normalizes trees, EVERY binding goes stale at once on an unrelated PR.
+name: Docs
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+jobs:
+  docs:
+    name: docs
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # drift's JSON output attributes stale anchors via git blame, which
+          # needs full history. Staleness detection itself does not.
+          fetch-depth: 0
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.3.11 # keep in step with test.yml
+
+      # Pinned deliberately, both the action ref and the drift release. The
+      # action defaults to version:latest; on a pre-1.0 tool whose signatures
+      # are AST fingerprints, floating the version invites a repo-wide false
+      # staleness event on a PR that changed nothing. Bump both on purpose.
+      - name: Install drift
+        uses: fiberplane/drift@v0.10.1
+        with:
+          version: v0.10.1
+
+      - name: Check documentation freshness
+        run: drift check
+
+      - name: Typecheck the docs tooling
+        run: bun run typecheck:scripts
+
+      - name: Test the docs reverse-lookup
+        run: bun test scripts/docs-governing.test.ts

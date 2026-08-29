@@ -107,6 +107,62 @@ Some kernel modules are **fully implemented and unit-tested but not yet called b
 
 When you pick up a later build-order step, prefer **wiring the existing library module into `runExecutor`** over re-implementing its logic inline — then point the integration/contract tests at the real executor path so the SPEC guarantee becomes one the shipping binary actually provides.
 
+## Docs are an input, not a cleanup step
+
+Parts of this repo are **normative**: SPEC.md does not describe what the kernel
+happens to do, it states what the kernel must do. The Law (§7), the four rework
+guards (§6), the binding stamp (§5), and the `(lane, status)` FSM (§3) are
+specified behaviour, and `CLAUDE.md`'s wired-vs-library inventory is what steers
+every agent session. Code that contradicts them is wrong even when its tests are
+green — and prose left behind by a change quietly misleads the next agent.
+
+[`drift`](https://github.com/fiberplane/drift) binds those documents to the
+symbols they govern. `drift.lock` records, per binding, an AST fingerprint of
+the target at the moment someone last vouched for the prose. It is a routing
+table, not a correctness checker: it tells you *which paragraph to re-read*,
+never that a paragraph is right.
+
+**Before editing anything under `src/`:**
+
+```bash
+bun run docs:governing src/quality/rework.ts   # -> SPEC.md
+```
+
+Anything it prints makes claims about the code you are about to change. **Read
+those sections first and implement against them.** Silence means the file is
+unbound and there is nothing to read — the common case, and it costs nothing.
+Do not skip this on the assumption that a change is small: issue #1 was a
+one-line cap comparison whose correct behaviour was specified in SPEC §6.
+
+**After changing code:**
+
+```bash
+bun run docs:check          # `drift check` — exits 1 on any stale anchor
+```
+
+A stale anchor is an obligation, not an error. Re-read the section it names,
+then either fix the prose or confirm it still holds:
+
+```bash
+drift link SPEC.md --doc-is-still-accurate
+```
+
+`drift link` **refuses** to re-stamp a stale anchor without that flag. Passing it
+is an assertion that you re-read the doc. Do not pass it to make CI green — a
+`drift.lock` diff that re-signs anchors while changing no prose is exactly what
+reviewers look for.
+
+**When adding or renaming a governed symbol**, update the binding
+(`drift link <doc> <file#Symbol>` / `drift unlink`) in the same change.
+
+Bindings are deliberately **symbol-level** (`file#Symbol`), not file-level: a
+binding to all of `src/controller/executor.ts` would flag on nearly every PR and
+train everyone to re-stamp reflexively, which is worse than no binding. And the
+binding set is deliberately small — `adr/`, `docs/archive/`, `docs/history/`,
+`prd/`, `CHANGELOG.md` and the `examples/`+`fixtures/` prompt templates are
+**never** bound. An ADR is a dated record of a decision and is *supposed* to
+describe the world as it was; prompt templates are runtime inputs, not docs.
+
 ## Design principles to apply consistently
 
 - **Deterministic flow, non-deterministic labor.** The kernel decides what's legal next; LLMs only produce and judge. No LLM in the steady-state dispatch loop.

@@ -1,0 +1,46 @@
+version = 1
+
+[[bindings]]
+doc = "CLAUDE.md"
+target = "SPEC.md#the-rework-loop-and-its-four-bounding-guards"
+sig = "ba95f6ab05cb0f71"
+
+[[bindings]]
+doc = "CLAUDE.md"
+target = "src/controller/executor.ts#runExecutor"
+sig = "601686c1f9de5806"
+
+[[bindings]]
+doc = "CLAUDE.md"
+target = "src/persistence/db.ts#SCHEMA_VERSION"
+sig = "6fa2fa6c576b623e"
+
+[[bindings]]
+doc = "SPEC.md"
+target = "src/checkpoint/checkpoint.ts#computeBindingStamp"
+sig = "c285309b07a9de1d"
+
+[[bindings]]
+doc = "SPEC.md"
+target = "src/law/contract.ts"
+sig = "fd885d49d7e797aa"
+
+[[bindings]]
+doc = "SPEC.md"
+target = "src/quality/rework.ts#decideQcReject"
+sig = "a93aaf0bb50316a3"
+
+[[bindings]]
+doc = "SPEC.md"
+target = "src/statemachine/transitions.ts#transition"
+sig = "12363a94731fa50f"
+
+[[bindings]]
+doc = "SPEC.md"
+target = "src/worker/integrity.ts#checkIntegrity"
+sig = "ec86cf6e6cd93960"
+
+[[bindings]]
+doc = "docs/installation.md"
+target = "src/cli/main.ts"
+sig = "8e3f2b9d9892ba38"
