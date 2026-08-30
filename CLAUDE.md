@@ -73,7 +73,7 @@ Quality comes from `work → check → bounded rework`, not from one smart call.
 - **Integrity check** — deterministic Summary Hook in the DONE transaction (files ⊆ owned paths, schema valid)
 - **Quality check** — a separate QC station (LLM critic, usually a pure `transform`, back-edge to an earlier lane)
 
-Rework is bounded by **four independent guards**: per-card cap → scrap, per-execution-attempt cap, progress-monotonicity on findings hash (not artifact), and budgets at card/wave/run scope + liveness watchdog.
+Rework is bounded by **four independent guards**: per-card, **per-gate** rework cap → scrap (`rework_cap` is declared on each station's `check:` block, so the counter it bounds is scoped to the `(card, gate)` pair — `cards.rework_count` stays the card's lifetime total, which is history, not a budget), per-execution-attempt cap, progress-monotonicity on findings hash (not artifact), and budgets at card/wave/run scope + liveness watchdog.
 
 ### The Law (SPEC §7)
 
@@ -101,11 +101,95 @@ See [`docs/build-order.md`](./docs/build-order.md) for the canonical sequence. S
 
 Some kernel modules are **fully implemented and unit-tested but not yet called by the production executor** (`src/controller/executor.ts` / `runExecutor`). This is deliberate — they are later-build-order capabilities waiting for their step — **not dead code or bugs**. Do not assume `runExecutor` exercises them just because the tests are green; the unit tests drive the modules directly, and some integration/crash tests drive the `src/test-harness/` scaffolding (`crash-oracle.ts`, `reference-flow-runner.ts`) rather than `runExecutor`.
 
-**Wired into `runExecutor` today:** the `(lane, status)` FSM (`statemachine/transitions.ts` — the executor routes every post-work transition through `transition()`), the effectful outbox + idempotency discipline (`checkpoint.ts` `writePendingIntent`/`commitIntent`/`reconcileOnResume`, gated on `station.effectful`), `cap_policy` (`flow.defaults.capPolicy`, applied via the FSM), the atomic claim, checkpoint skip-on-resume (binding-stamp match), **binding-stamp cascade invalidation** (`cascadeInvalidation` — a stale upstream stamp on resume invalidates downstream checkpoints), the **MARK_DONE owned-paths integrity gate** (`worker/integrity.ts` `checkIntegrity` — opt-in per flow via `defaults.enforce_owned_paths`; a write outside `owned_paths` hard-pauses to `hold`), the **per-wave/subtree budget** (`aggregateByWave`/`checkWaveBudget` — guard #4's wave scope; an over-budget `parent_id` subtree is scrapped without halting the run), **fan-out / fan-in** (`dag/expand.ts` `commitFanOut`/`validateExpansion`/`evaluateFanIn` — acyclic-deps + disjoint-ownership validation, child seeding, quorum/all/best-effort merge), **rank QC + HITL selection** (`quality/rank.ts` `runRankCheck` — short-list, hold for a human pick, `conduit reply`), the consumption andon, the liveness watchdog (`checkLiveness`/`checkConsumptionAndon`), and the **event-driven worker pool** (`conduit run --concurrency K>1`): real out-of-process workers (`worker/worker-entry.ts`, spawned via the `makeWorkerPool`/`buildWorkerPool` seam as `conduit __worker`), START_WORK/MARK_DONE over Bun IPC (codec-validated by `worker/ipc-protocol.ts`), the K-bounded concurrency cap (run-level `concurrency` ANDed with station `wip` via the atomic claim), `beginWork`-stamped leases + live `reconcile` for hung-worker reclaim, MARK_DONE token attribution into the run/wave budgets, and `watchdog.planDrain` (drain/hard-kill on andon trip — now driven against genuinely concurrent in-flight workers). Only PLAIN PURE deterministic stations are POOLED as out-of-process workers; transform/agentic/fan-out/effectful/`enforce_owned_paths` stations stay in-process. **(v10)** Under `concurrency>1`, plain TRANSFORM siblings ready in one tick run as *overlapping in-process adapter calls* (the fan-out reviewer case) — per-call token attribution isolated via `AsyncLocalStorage`, K-bounded, with fan-out/effectful/gated/deliver/rank transforms excluded and still serial. An optional `child_stagger_seconds` on the fan-out station gates siblings behind `cards.release_at` so the first child warms a shared prompt-prefix cache before the rest fire.
+**Wired into `runExecutor` today:** the `(lane, status)` FSM (`statemachine/transitions.ts` — the executor routes every post-work transition through `transition()`), the effectful outbox + idempotency discipline (`checkpoint.ts` `writePendingIntent`/`commitIntent`/`reconcileOnResume`, gated on `station.effectful`), `cap_policy` (`flow.defaults.capPolicy`, applied via the FSM) with guard #1's counter derived **per `(card, gate)`** from the card_log (`quality/rework.ts` `countGateReworks`) rather than the card's lifetime `rework_count`, the atomic claim, checkpoint skip-on-resume (binding-stamp match), **binding-stamp cascade invalidation** (`cascadeInvalidation` — a stale upstream stamp on resume invalidates downstream checkpoints), the **MARK_DONE owned-paths integrity gate** (`worker/integrity.ts` `checkIntegrity` — opt-in per flow via `defaults.enforce_owned_paths`; a write outside `owned_paths` hard-pauses to `hold`), the **per-wave/subtree budget** (`aggregateByWave`/`checkWaveBudget` — guard #4's wave scope; an over-budget `parent_id` subtree is scrapped without halting the run), **fan-out / fan-in** (`dag/expand.ts` `commitFanOut`/`validateExpansion`/`evaluateFanIn` — acyclic-deps + disjoint-ownership validation, child seeding, quorum/all/best-effort merge), **rank QC + HITL selection** (`quality/rank.ts` `runRankCheck` — short-list, hold for a human pick, `conduit reply`), the consumption andon, the liveness watchdog (`checkLiveness`/`checkConsumptionAndon`), and the **event-driven worker pool** (`conduit run --concurrency K>1`): real out-of-process workers (`worker/worker-entry.ts`, spawned via the `makeWorkerPool`/`buildWorkerPool` seam as `conduit __worker`), START_WORK/MARK_DONE over Bun IPC (codec-validated by `worker/ipc-protocol.ts`), the K-bounded concurrency cap (run-level `concurrency` ANDed with station `wip` via the atomic claim), `beginWork`-stamped leases + live `reconcile` for hung-worker reclaim, MARK_DONE token attribution into the run/wave budgets, and `watchdog.planDrain` (drain/hard-kill on andon trip — now driven against genuinely concurrent in-flight workers). Only PLAIN PURE deterministic stations are POOLED as out-of-process workers; transform/agentic/fan-out/effectful/`enforce_owned_paths` stations stay in-process. **(v10)** Under `concurrency>1`, plain TRANSFORM siblings ready in one tick run as *overlapping in-process adapter calls* (the fan-out reviewer case) — per-call token attribution isolated via `AsyncLocalStorage`, K-bounded, with fan-out/effectful/gated/deliver/rank transforms excluded and still serial. An optional `child_stagger_seconds` on the fan-out station gates siblings behind `cards.release_at` so the first child warms a shared prompt-prefix cache before the rest fire.
 
 **Built but NOT yet driven by `runExecutor`:** none of the kernel substrate remains library-only — the remaining unshipped work is the agentic Tool-Bridge (step 9) and kaizen (step 10), which are new surfaces rather than wired-vs-unwired modules.
 
 When you pick up a later build-order step, prefer **wiring the existing library module into `runExecutor`** over re-implementing its logic inline — then point the integration/contract tests at the real executor path so the SPEC guarantee becomes one the shipping binary actually provides.
+
+## Docs are an input, not a cleanup step
+
+Parts of this repo are **normative**: SPEC.md does not describe what the kernel
+happens to do, it states what the kernel must do. The Law (§7), the four rework
+guards (§6), the binding stamp (§5), and the `(lane, status)` FSM (§3) are
+specified behaviour, and `CLAUDE.md`'s wired-vs-library inventory is what steers
+every agent session. Code that contradicts them is wrong even when its tests are
+green — and prose left behind by a change quietly misleads the next agent.
+
+[`drift`](https://github.com/fiberplane/drift) binds those documents to the
+symbols they govern. `drift.lock` records, per binding, an AST fingerprint of
+the target at the moment someone last vouched for the prose. It is a routing
+table, not a correctness checker: it tells you *which paragraph to re-read*,
+never that a paragraph is right.
+
+Two obligations, at two different moments. They are separate on purpose — one is
+an input to the work, the other is only answerable once the work has settled.
+
+**Once, when you scope a task** — not per edit — name the files the task will
+touch:
+
+```bash
+bun run docs:governing src/quality/rework.ts src/controller/gate-rework.ts
+# -> SPEC.md
+```
+
+Anything it prints makes claims about the code you are about to change. **Read
+those sections and implement against them.** Silence means nothing is bound and
+there is nothing to read — the common case, and it costs nothing. Do not skip
+this because a change looks small: issue #1 was a one-line cap comparison whose
+correct behaviour was specified in SPEC §6.
+
+Run it once per task, not once per edit. Editing a file five times does not make
+SPEC §6 say anything new.
+
+**At commit time** — enforced by `.githooks/pre-commit`. Two different commands,
+and the difference matters:
+
+```bash
+bun run docs:check       # SCOPED to your staged files — what the hook runs.
+bun run docs:check:all   # the WHOLE corpus. Informational; see below.
+```
+
+The scoped form covers deletions and both sides of a rename, since a binding
+whose target no longer exists is precisely what needs flagging, and it fails
+closed — if it cannot determine what is bound, it errors rather than reporting a
+clean bill of health. (The `docs` CI job runs the same
+`scripts/docs-check.sh` over a commit range instead of the index.)
+
+Reach for `docs:check:all` only when you want the repo-wide picture. It is
+deliberately **not** what gates anything: unscoped, a single stale anchor
+anywhere fails you for drift you did not introduce, which is how a check earns a
+permanent `--no-verify`.
+
+The commit is the unit here because "is this prose still true?" cannot be
+answered while the code is still moving; asking per-edit asks before the answer
+exists, and invites rewriting a SPEC paragraph three times as one change
+settles.
+
+A stale anchor is an obligation, not an error. Re-read the section it names,
+then either fix the prose or confirm it still holds — re-stamping **the document
+the check named**, which is not always `SPEC.md` (`CLAUDE.md` and
+`docs/installation.md` carry anchors too):
+
+```bash
+drift link <doc> --doc-is-still-accurate     # e.g. drift link SPEC.md ...
+```
+
+`drift link` **refuses** to re-stamp a stale anchor without that flag. Passing it
+is an assertion that you re-read the doc. Do not pass it to make the hook or CI
+pass — a `drift.lock` diff that re-signs anchors while changing no prose is
+exactly what reviewers look for.
+
+**When adding or renaming a governed symbol**, update the binding
+(`drift link <doc> <file#Symbol>` / `drift unlink`) in the same change.
+
+Bindings are deliberately **symbol-level** (`file#Symbol`), not file-level: a
+binding to all of `src/controller/executor.ts` would flag on nearly every PR and
+train everyone to re-stamp reflexively, which is worse than no binding. And the
+binding set is deliberately small — `adr/`, `docs/archive/`, `docs/history/`,
+`prd/`, `CHANGELOG.md` and the `examples/`+`fixtures/` prompt templates are
+**never** bound. An ADR is a dated record of a decision and is *supposed* to
+describe the world as it was; prompt templates are runtime inputs, not docs.
 
 ## Design principles to apply consistently
 

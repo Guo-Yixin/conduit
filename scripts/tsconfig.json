@@ -1,0 +1,11 @@
+{
+  // Scoped typecheck for the docs-routing tooling. `../tsconfig.json` only
+  // includes `src/**/*`, so scripts/ was previously unchecked.
+  //
+  // explain-d2-spike.ts is deliberately excluded: it predates this config and
+  // has pre-existing type errors against the d2 CompileRequest type. Fixing or
+  // deleting a spike is not this change's business — but neither should the new
+  // tooling stay unchecked because of it.
+  "extends": "../tsconfig.json",
+  "include": ["docs-governing.ts", "docs-governing.test.ts", "docs-check.test.ts"]
+}

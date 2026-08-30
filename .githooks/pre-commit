@@ -1,0 +1,35 @@
+#!/usr/bin/env bash
+# Commit-level documentation reconciliation.
+#
+# WHY THE COMMIT, NOT THE EDIT: "is this prose still true?" is not answerable
+# while the code is still moving. Checking per-edit would ask the question
+# before the answer exists, and invite rewriting a SPEC paragraph three times as
+# one change settles. A commit is the first coherent unit where the question has
+# an answer. (Reading the docs BEFORE the work is a separate concern with a
+# different unit — once per task; see `docs:governing` in CLAUDE.md.)
+#
+# The verdict itself lives in scripts/docs-check.sh, shared verbatim with the
+# `docs` CI job so the backstop cannot disagree with the hook.
+#
+# Install once:  git config core.hooksPath .githooks
+# Bypass:        git commit --no-verify      (CI's `docs` job still runs)
+# Warn-only:     CONDUIT_DRIFT_ADVISORY=1 git commit
+set -euo pipefail
+
+# `--staged` rather than a diff spelled out here: which paths a commit is
+# accountable for is part of the verdict, so it lives with the verdict in
+# scripts/docs-check.sh. Copying the git invocation into this hook is how the
+# hook and CI would end up checking different things.
+scripts/docs-check.sh --staged && exit 0
+
+cat >&2 <<'MSG'
+
+  Bypass once:  git commit --no-verify
+  Warn only:    CONDUIT_DRIFT_ADVISORY=1 git commit
+MSG
+
+[ "${CONDUIT_DRIFT_ADVISORY:-0}" = "1" ] && {
+  echo "(advisory mode — committing anyway)" >&2
+  exit 0
+}
+exit 1

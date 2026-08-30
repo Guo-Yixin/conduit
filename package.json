@@ -31,8 +31,12 @@
   "scripts": {
     "test": "bun test src/ --pass-with-no-tests",
     "test:blackbox": "bun test blackbox/ --pass-with-no-tests",
+    "docs:check": "scripts/docs-check.sh --staged",
+    "docs:check:all": "drift check",
+    "docs:governing": "bun scripts/docs-governing.ts",
     "typecheck": "tsc --noEmit",
-    "typecheck:blackbox": "tsc --noEmit -p blackbox"
+    "typecheck:blackbox": "tsc --noEmit -p blackbox",
+    "typecheck:scripts": "tsc --noEmit -p scripts"
   },
   "devDependencies": {
     "bun-types": "^1.3.14",
