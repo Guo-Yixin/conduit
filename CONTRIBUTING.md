@@ -35,7 +35,9 @@ git config core.hooksPath .githooks
 (`brew install fiberplane/tap/drift` works too, but the tap tracks latest and
 offers no versioned formula, so it can drift out of step with CI.)
 
-The hook runs at commit time, scoped to your staged files — additions,
+The hook runs at commit time (`bun run docs:check` runs the same thing by hand;
+`bun run docs:check:all` reports the whole corpus and gates nothing), scoped to
+your staged files — additions,
 modifications, deletions and both sides of a rename, since a binding whose
 target was moved or removed is exactly what needs flagging — and tells you when
 a change leaves bound prose unvouched-for. It is skipped entirely when `drift`

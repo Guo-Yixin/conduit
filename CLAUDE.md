@@ -146,18 +146,20 @@ SPEC §6 say anything new.
 and the difference matters:
 
 ```bash
-scripts/docs-check.sh <path>...   # SCOPED — only anchors bound to those paths.
-                                  # What the hook and the `docs` CI job run.
-bun run docs:check                # `drift check`, the WHOLE corpus, unscoped.
+bun run docs:check       # SCOPED to your staged files — what the hook runs.
+bun run docs:check:all   # the WHOLE corpus. Informational; see below.
 ```
 
-The hook hands `docs-check.sh` your staged paths — including deletions and both
-sides of a rename, since a binding whose target no longer exists is precisely
-what needs flagging. Reach for `bun run docs:check` only when you want the
-repo-wide picture: unscoped, a single stale anchor anywhere fails you for drift
-you did not introduce, which is how a check earns a permanent `--no-verify`.
-The scoped form fails closed — if it cannot determine what is bound, it errors
-rather than reporting a clean bill of health.
+The scoped form covers deletions and both sides of a rename, since a binding
+whose target no longer exists is precisely what needs flagging, and it fails
+closed — if it cannot determine what is bound, it errors rather than reporting a
+clean bill of health. (The `docs` CI job runs the same
+`scripts/docs-check.sh` over a commit range instead of the index.)
+
+Reach for `docs:check:all` only when you want the repo-wide picture. It is
+deliberately **not** what gates anything: unscoped, a single stale anchor
+anywhere fails you for drift you did not introduce, which is how a check earns a
+permanent `--no-verify`.
 
 The commit is the unit here because "is this prose still true?" cannot be
 answered while the code is still moving; asking per-edit asks before the answer

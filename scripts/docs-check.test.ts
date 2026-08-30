@@ -12,20 +12,20 @@
  *      that match no binding, so the check passed on exactly the input it was
  *      meant to inspect.
  *
- * These tests run the command EXTRACTED FROM .githooks/pre-commit rather than a
+ * These tests run the command EXTRACTED FROM scripts/docs-check.sh rather than a
  * copy of it, against a throwaway git repo. A copy would be free to agree with
- * the test while the hook quietly regressed.
+ * the test while the real thing quietly regressed.
  */
 import { describe, it, expect, beforeAll, afterAll } from 'bun:test';
 import { mkdtempSync, rmSync, writeFileSync, mkdirSync, readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
-/** The `git diff` invocation the hook actually runs, lifted out of the hook. */
+/** The `git diff` invocation `--staged` actually runs, lifted out of the script. */
 function stagedDiffCommand(): string {
-  const hook = readFileSync('.githooks/pre-commit', 'utf-8');
-  const match = /done < <\((git diff --cached [^)]*)\)/.exec(hook);
-  if (match === null) throw new Error('could not find the staged-diff command in .githooks/pre-commit');
+  const script = readFileSync('scripts/docs-check.sh', 'utf-8');
+  const match = /done < <\((git diff --cached [^)]*)\)/.exec(script);
+  if (match === null) throw new Error('could not find the staged-diff command in scripts/docs-check.sh');
   return match[1] as string;
 }
 
@@ -98,6 +98,21 @@ describe('the staged-file list the hook builds', () => {
       'src/old-name.ts',
       'src/with space.ts',
     ]);
+  });
+});
+
+describe('callers delegate rather than re-deriving the path list', () => {
+  it('the pre-commit hook runs --staged and spells out no diff of its own', () => {
+    // A second copy of the git invocation is a second thing that can disagree
+    // with CI about what a commit is accountable for.
+    const hook = readFileSync('.githooks/pre-commit', 'utf-8');
+    expect(hook).toContain('scripts/docs-check.sh --staged');
+    expect(hook).not.toContain('git diff');
+  });
+
+  it('the docs workflow shares the same script for its commit-range mode', () => {
+    const workflow = readFileSync('.github/workflows/docs.yml', 'utf-8');
+    expect(workflow).toContain('scripts/docs-check.sh "${changed[@]}"');
   });
 });
 

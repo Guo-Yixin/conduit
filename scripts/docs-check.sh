@@ -18,7 +18,8 @@
 # POSIX sh has no array, and re-splitting on $IFS is how such a path silently
 # becomes two paths that match no binding.
 #
-# Usage: scripts/docs-check.sh <file>...
+# Usage: scripts/docs-check.sh --staged     (what you are about to commit)
+#        scripts/docs-check.sh <file>...   (an explicit set, e.g. a CI range)
 # Exit:  0 = nothing this change touched is stale (or drift is not installed)
 #        1 = at least one bound doc is now unvouched-for, or the check itself
 #            could not run (see FAIL CLOSED below)
@@ -28,6 +29,30 @@ command -v drift >/dev/null 2>&1 || {
   echo "docs-check: drift not installed — skipping (see CONTRIBUTING.md)" >&2
   exit 0
 }
+
+# TWO input modes, ONE verdict. `--staged` derives the paths itself — used by
+# .githooks/pre-commit and `bun run docs:check`; the `docs` CI job passes an
+# explicit list because it diffs a commit range instead. The git invocation
+# lives HERE rather than being copied into each caller, for the same reason the
+# verdict does: a third copy is a third thing that can quietly disagree.
+#
+# ACMD + --no-renames, NOT ACM. A binding target that is DELETED or RENAMED is
+# exactly what the routing table should shout about — drift reports a missing
+# target as STALE (file not found) — and ACM skipped it silently. --no-renames
+# decomposes a rename into delete + add so BOTH sides get checked.
+#
+# -z keeps each pathname atomic: word-splitting an unquoted list turns
+# "src/my file.ts" into two paths that match no binding, so the check passes on
+# precisely the input it was meant to inspect.
+if [ "${1:-}" = "--staged" ]; then
+  shift
+  staged=()
+  while IFS= read -r -d '' path; do
+    staged+=("$path")
+  done < <(git diff --cached -z --name-only --no-renames --diff-filter=ACMD)
+  set -- ${staged[@]+"${staged[@]}"}
+fi
+
 [ "$#" -gt 0 ] || exit 0
 [ -f drift.lock ] || exit 0
 
