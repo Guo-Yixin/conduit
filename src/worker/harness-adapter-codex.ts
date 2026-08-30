@@ -73,6 +73,13 @@ interface CodexUsageEvent {
 /** Per-turn usage summed across every turn.completed event in the stream. */
 interface AccumulatedUsage {
   inputTokens: number;
+  /**
+   * The CACHED SUBSET of inputTokens (issue #5). Codex reports
+   * `cached_input_tokens` alongside `input_tokens`, where input_tokens is the
+   * INCLUSIVE total — so uncached input is the difference, and the two must
+   * never be added or the input would be double-counted.
+   */
+  cachedInputTokens: number;
   outputTokens: number;
   reasoningTokens: number;
   cost: number;
@@ -163,7 +170,9 @@ async function defaultProbe(command: string): Promise<BinaryProbe> {
  */
 function accumulateUsage(stdout: string): AccumulatedUsage | null {
   let seen = false;
-  const total: AccumulatedUsage = { inputTokens: 0, outputTokens: 0, reasoningTokens: 0, cost: 0 };
+  const total: AccumulatedUsage = {
+    inputTokens: 0, cachedInputTokens: 0, outputTokens: 0, reasoningTokens: 0, cost: 0,
+  };
   for (const line of stdout.split('\n')) {
     const trimmed = line.trim();
     if (trimmed.length === 0) continue;
@@ -182,6 +191,7 @@ function accumulateUsage(stdout: string): AccumulatedUsage | null {
       if (usage !== undefined) {
         seen = true;
         total.inputTokens += usage.input_tokens ?? 0;
+        total.cachedInputTokens += usage.cached_input_tokens ?? 0;
         total.outputTokens += usage.output_tokens ?? 0;
         total.reasoningTokens += usage.reasoning_output_tokens ?? 0;
         // Real codex usage carries no cost; sum it only for a hypothetical
@@ -303,7 +313,23 @@ export function createCodexHarnessAdapter(config: CodexHarnessAdapterConfig): Ha
 
       return {
         outputs: [],
-        usage: { tokens, cost },
+        usage: {
+          tokens,
+          cost,
+          // Issue #5. input_tokens is INCLUSIVE of cached_input_tokens here, so
+          // uncached input is the difference — clamped at 0 because the two
+          // counters are summed independently across turns and a malformed
+          // event could otherwise drive it negative. Reasoning tokens are billed
+          // as output, which is where the total already counts them.
+          breakdown: {
+            inputTokens: Math.max(0, usage.inputTokens - usage.cachedInputTokens),
+            outputTokens: usage.outputTokens + usage.reasoningTokens,
+            cacheReadInputTokens: usage.cachedInputTokens,
+            // Codex reports no cache-CREATION counter, only reads. Zero here is
+            // "the provider does not report it", not "no cache was written".
+            cacheCreationInputTokens: 0,
+          },
+        },
       };
     },
   };

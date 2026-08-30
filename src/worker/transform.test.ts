@@ -562,6 +562,10 @@ describe('runTransformStation — journal usage (OTel GenAI)', () => {
     expect(db.getStationUsage('card-otel', 'brief', 0)).toEqual({
       'gen_ai.usage.input_tokens': 42,
       'gen_ai.usage.output_tokens': 7,
+      // A transform reports no cache split (issue #5 widened the HARNESS
+      // path); the columns stay absent and aggregate to 0.
+      'gen_ai.usage.cache_read_input_tokens': 0,
+      'gen_ai.usage.cache_creation_input_tokens': 0,
       'gen_ai.request.model': 'gpt-4o-mini',
       cost_usd: 0.0123,
     });
