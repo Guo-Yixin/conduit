@@ -304,6 +304,41 @@ describe('worker crash', () => {
 });
 
 // ---------------------------------------------------------------------------
+// Issue #3 — a provider rate limit returns the card to ready, spending nothing.
+// ---------------------------------------------------------------------------
+
+describe('provider rate limit', () => {
+  it('working + RATE_LIMITED → ready (lane unchanged, re-dispatchable)', () => {
+    const out = next(mkState({ lane: 'draft', status: 'working' }), { type: 'RATE_LIMITED' });
+    expect(out.status).toBe('ready');
+    expect(out.lane).toBe('draft');
+  });
+
+  it('consumes NEITHER the execution attempt NOR the rework counter', () => {
+    // This is the whole point. The work never ran and nothing was billed, so
+    // charging the card for it is what let a session cap burn a whole budget in
+    // three seconds and scrap already-paid-for work.
+    const before = mkState({ lane: 'draft', status: 'working' });
+    const out = next(before, { type: 'RATE_LIMITED' });
+    expect(out.executionAttempt).toBe(before.executionAttempt);
+    expect(out.reworkCount).toBe(before.reworkCount);
+  });
+
+  it('never scraps — a cap is an operating condition, not a failure', () => {
+    const out = next(mkState({ lane: 'draft', status: 'working' }), { type: 'RATE_LIMITED' });
+    expect(out.lane).not.toBe('scrap');
+    expect(out.scrapReason).toBeUndefined();
+  });
+
+  it('is ILLEGAL from any status other than working', () => {
+    for (const status of ['ready', 'claimed', 'done_pending_ack', 'held'] as const) {
+      const result = transition(mkState({ lane: 'draft', status }), { type: 'RATE_LIMITED' }, mkCtx());
+      expect(result.ok).toBe(false);
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
 // Finding #8 — recovery OUT of interrupted (SPEC §15 reconcile). Without this
 // an interrupted card is stranded — no legal `from` leaves the state.
 // ---------------------------------------------------------------------------

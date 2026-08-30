@@ -159,6 +159,20 @@ export interface LivenessState {
   lastAdapterActivityAt?: number;
   /** Number of workers with an active (non-expired) lease. */
   activeWorkerCount: number;
+  /**
+   * True if any READY card is gated behind a future `cards.release_at`.
+   *
+   * A gated card is WAITING ON PURPOSE, at a known instant the run loop is
+   * already sleeping toward — the opposite of a deadlock. Without this, a
+   * rate-limit park (issue #3) or a fan-out stagger longer than
+   * `no_progress_minutes` reads as "no progress + no active worker" and halts a
+   * run that was about to resume on its own.
+   *
+   * The consumption andon remains the guard against waiting longer than the run
+   * can afford: it is checked BEFORE the loop sleeps to a gate, so a park that
+   * outlasts the wall-clock budget still halts.
+   */
+  hasReleaseGatedCard?: boolean;
   /** True if any card's dependency was scrapped and the card is stuck waiting. */
   hasScrappedDep: boolean;
   /** True if any card is in the hold lane awaiting a human HITL decision. */
@@ -213,6 +227,14 @@ export function checkLiveness(
   const noActiveWorkers = state.activeWorkerCount === 0;
 
   if (!noProgress || !noActiveWorkers) {
+    return { tripped: false };
+  }
+
+  // Scheduled waiting is not a stall. This check sits AFTER the two conditions
+  // above so it only ever suppresses a would-be trip, and deliberately does NOT
+  // get a blockingReason: the liveness watchdog answers "is this run wedged",
+  // and a run counting down to a gate it will open itself is not.
+  if (state.hasReleaseGatedCard === true) {
     return { tripped: false };
   }
 

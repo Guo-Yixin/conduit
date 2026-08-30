@@ -267,6 +267,7 @@ against the matrix.
 | Event | Transition |
 |---|---|
 | Worker crash mid-`working` | → `interrupted`; reconcile re-hydrates (§9). Effectful side effects guarded by intent log (§5). |
+| Provider **rate limit** mid-`working` (agentic/harness) | → back to `ready` at the SAME lane, `cards.release_at` stamped with the provider's reported reset. Consumes **neither** the rework cap nor the execution-attempt cap: the work never ran and nothing was billed. The release gate (§8) keeps the card undispatchable until then, and the liveness watchdog does not read a gated card as a stall — but the **consumption andon still applies**, so a cap the run cannot afford to wait out halts it rather than idling. |
 | `MARK_DONE` fails the Summary Hook (integrity) | → back to `working`, counts against the **execution-attempt** cap (§7), not the rework cap. |
 | QC reject, under cap | → `on_reject` lane, `attempt++`, `status=waiting`. |
 | QC reject, cap reached, `cap_policy=scrap` | → `scrap`. |

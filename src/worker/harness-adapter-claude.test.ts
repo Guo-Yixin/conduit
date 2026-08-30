@@ -17,7 +17,7 @@
  *   - createClaudeHarnessAdapter(config) returns a HarnessAdapter with
  *     name='claude-headless', reportsUsage=true, canRestrictTools=true, and an
  *     injected `run` seam + `probe` seam.
- *   - invoke() builds:  ['-p','--output-format','json', (--model M)?,
+ *   - invoke() builds:  ['-p','--output-format','stream-json','--verbose', (--model M)?,
  *       (--allowed-tools <csv>)?, '--', <prompt>]  — the `--` terminates option
  *     parsing so the variadic --allowed-tools cannot swallow the prompt.
  *   - --allowed-tools is added IFF call.tools is non-empty; an empty tools list
@@ -34,6 +34,8 @@
 import { describe, it, expect } from 'bun:test';
 import {
   createClaudeHarnessAdapter,
+  parseClaudeStream,
+  bindingResetAtMs,
   type ClaudeHarnessAdapterConfig,
 } from './harness-adapter-claude';
 import type {
@@ -44,7 +46,8 @@ import type {
 import type { HarnessAdapter, HarnessInvocation, BinaryProbe } from './harness-adapter';
 
 // ---------------------------------------------------------------------------
-// Recorded `claude -p --output-format json` payloads (no live network).
+// Recorded `claude -p --output-format stream-json --verbose` payloads (no live
+// network). Each is ONE NDJSON line; the adapter takes the last `result` event.
 // ---------------------------------------------------------------------------
 
 /** A realistic success envelope, cache counters zero (tokens = input+output). */
@@ -163,7 +166,7 @@ describe('claude-headless adapter: identity + static capabilities', () => {
 // ---------------------------------------------------------------------------
 
 describe('claude-headless adapter: invocation building (AC1)', () => {
-  it('spawns `claude -p --output-format json` with the prompt as a terminated positional', async () => {
+  it('spawns `claude -p --output-format stream-json --verbose` with the prompt as a terminated positional', async () => {
     const { run, calls } = makeRun({ stdout: RECORDED_SUCCESS });
     const adapter = makeAdapter({ run });
 
@@ -173,7 +176,10 @@ describe('claude-headless adapter: invocation building (AC1)', () => {
     const { cmd } = calls[0]!;
     expect(cmd.command).toBe('claude');
     // Structured print mode.
-    expect(cmd.args.slice(0, 3)).toEqual(['-p', '--output-format', 'json']);
+    // stream-json + --verbose (issue #5): the NDJSON stream is the only form
+    // carrying rate_limit_event, and its terminal `result` event has the same
+    // fields the plain json output did.
+    expect(cmd.args.slice(0, 4)).toEqual(['-p', '--output-format', 'stream-json', '--verbose']);
     // The prompt is the final positional, guarded by a `--` option terminator so
     // the variadic --allowed-tools cannot consume it.
     expect(cmd.args).toContain('--');
@@ -214,7 +220,16 @@ describe('claude-headless adapter: structured usage parsing (AC2)', () => {
     const result = await adapter.invoke(invocation());
 
     // Not scraped from free text — parsed from the JSON usage object.
-    expect(result.usage).toEqual({ tokens: 1500, cost: 0.0123 });
+    // tokens stays the TRUE TOTAL (the budget authority); the breakdown splits
+    // the same 1500 into its four classes (issue #5).
+    expect(result.usage).toEqual({
+      tokens: 1500,
+      cost: 0.0123,
+      breakdown: {
+        inputTokens: 1000, outputTokens: 500,
+        cacheReadInputTokens: 0, cacheCreationInputTokens: 0,
+      },
+    });
   });
 
   it('sums all four disjoint usage counters (input+output+cache_creation+cache_read)', async () => {
@@ -222,7 +237,17 @@ describe('claude-headless adapter: structured usage parsing (AC2)', () => {
 
     const result = await adapter.invoke(invocation());
 
-    expect(result.usage).toEqual({ tokens: 2000, cost: 0.05 });
+    // The four classes are DISJOINT in claude's schema, so the total is their
+    // sum and the breakdown reports each separately (issue #5) — before this,
+    // all 2000 landed in the journal's input_tokens with output_tokens 0.
+    expect(result.usage).toEqual({
+      tokens: 2000,
+      cost: 0.05,
+      breakdown: {
+        inputTokens: 1000, outputTokens: 500,
+        cacheReadInputTokens: 200, cacheCreationInputTokens: 300,
+      },
+    });
   });
 
   it('treats absent usage subfields as zero (older payloads with only input/output)', async () => {
@@ -238,7 +263,14 @@ describe('claude-headless adapter: structured usage parsing (AC2)', () => {
 
     const result = await adapter.invoke(invocation());
 
-    expect(result.usage).toEqual({ tokens: 50, cost: 0.002 });
+    expect(result.usage).toEqual({
+      tokens: 50,
+      cost: 0.002,
+      breakdown: {
+        inputTokens: 40, outputTokens: 10,
+        cacheReadInputTokens: 0, cacheCreationInputTokens: 0,
+      },
+    });
   });
 
   it('returns no fabricated output references (declared outputs are collected from disk by the executor)', async () => {
@@ -320,5 +352,136 @@ describe('claude-headless adapter: named parse failures, never silent zero-usage
     });
 
     await expect(adapter.invoke(invocation())).rejects.toThrow(/claude-headless/i);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Issue #3 — a provider rate limit is not a crash
+// ---------------------------------------------------------------------------
+
+/**
+ * A genuinely rate-limited `claude -p` run, as probed against a capped account:
+ * NONZERO exit, EMPTY stderr, and every diagnostic on stdout. Note
+ * `subtype: 'success'` sitting alongside `is_error: true` — anything keying on
+ * subtype to decide success gets this exactly backwards.
+ */
+const RECORDED_RATE_LIMITED = JSON.stringify({
+  type: 'result',
+  subtype: 'success',
+  is_error: true,
+  api_error_status: 429,
+  terminal_reason: 'api_error',
+  result: "You've hit your session limit · resets 3pm (UTC)",
+  total_cost_usd: 0,
+});
+
+const RECORDED_RATE_LIMIT_EVENT = JSON.stringify({
+  type: 'rate_limit_event',
+  rate_limit_info: {
+    status: 'allowed_warning',
+    isUsingOverage: false,
+    unifiedWindows: {
+      five_hour: { utilization: 0.06, resetsAt: 1788125400 },
+      seven_day: { utilization: 0.75, resetsAt: 1788328800 },
+    },
+  },
+});
+
+describe('claude-headless adapter: rate limits (issue #3)', () => {
+  it('classifies a 429 distinctly from a crash, so the executor can park it', async () => {
+    // The WHOLE point: before this, a cap and a segfault were both
+    // 'harness-nonzero-exit', so nothing downstream could tell "retrying is
+    // pointless for hours" from "retrying might work".
+    const adapter = makeAdapter({
+      run: makeRun({ stdout: RECORDED_RATE_LIMITED, exitCode: 1, stderr: '' }).run,
+    });
+
+    await expect(adapter.invoke(invocation())).rejects.toMatchObject({
+      code: 'harness-rate-limited',
+    });
+  });
+
+  it('reads the 429 from stdout even though the exit code fires first', async () => {
+    // stderr is EMPTY on this failure. Bailing on the exit code before parsing
+    // stdout produced a journal row reading "exited with code 1:" with nothing
+    // after the colon — every diagnostic discarded.
+    const adapter = makeAdapter({
+      run: makeRun({ stdout: RECORDED_RATE_LIMITED, exitCode: 1, stderr: '' }).run,
+    });
+
+    await expect(adapter.invoke(invocation())).rejects.toThrow(/session limit/);
+  });
+
+  it('carries the provider-reported reset time so the park is not a guess', async () => {
+    const stdout = [RECORDED_RATE_LIMIT_EVENT, RECORDED_RATE_LIMITED].join('\n');
+    const adapter = makeAdapter({ run: makeRun({ stdout, exitCode: 1 }).run });
+
+    // The seven_day window is the most-consumed, so it is the one that capped
+    // this call — resetsAt is epoch SECONDS on the wire, milliseconds here.
+    await expect(adapter.invoke(invocation())).rejects.toMatchObject({
+      code: 'harness-rate-limited',
+      resetAtMs: 1788328800 * 1000,
+    });
+  });
+
+  it('still reports a NON-429 nonzero exit as a crash, with the payload detail', async () => {
+    const stdout = JSON.stringify({
+      type: 'result', is_error: true, terminal_reason: 'refusal', result: 'nope',
+    });
+    const adapter = makeAdapter({ run: makeRun({ stdout, exitCode: 2, stderr: '' }).run });
+
+    const err = await adapter.invoke(invocation()).catch((e: unknown) => e);
+    expect((err as { code?: string }).code).toBe('harness-nonzero-exit');
+    // Strictly more informative than the empty stderr it used to print.
+    expect((err as Error).message).toMatch(/refusal/);
+  });
+
+  it('falls back to stderr when the stream carried no result event at all', async () => {
+    const adapter = makeAdapter({
+      run: makeRun({ stdout: '', exitCode: 3, stderr: 'segfault' }).run,
+    });
+
+    const err = await adapter.invoke(invocation()).catch((e: unknown) => e);
+    expect((err as { code?: string }).code).toBe('harness-nonzero-exit');
+    expect((err as Error).message).toMatch(/segfault/);
+  });
+});
+
+describe('parseClaudeStream / bindingResetAtMs', () => {
+  it('takes the LAST result event and the LAST capacity reading', () => {
+    const stdout = [
+      JSON.stringify({ type: 'system', subtype: 'init' }),
+      RECORDED_RATE_LIMIT_EVENT,
+      RECORDED_SUCCESS,
+    ].join('\n');
+
+    const parsed = parseClaudeStream(stdout);
+    expect(parsed.result?.total_cost_usd).toBe(0.0123);
+    expect(parsed.rateLimit?.status).toBe('allowed_warning');
+    expect(parsed.rateLimit?.windows).toHaveLength(2);
+  });
+
+  it('skips a malformed line rather than failing the whole invocation', () => {
+    // This parse now runs on the FAILURE path too, where a half-written stream
+    // is likely — one bad line must not discard the diagnostics after it.
+    const parsed = parseClaudeStream(['{not json', RECORDED_SUCCESS].join('\n'));
+    expect(parsed.result?.total_cost_usd).toBe(0.0123);
+  });
+
+  it('is empty for a stream with no result event', () => {
+    expect(parseClaudeStream('').result).toBeNull();
+    expect(parseClaudeStream(JSON.stringify({ type: 'system' })).result).toBeNull();
+  });
+
+  it('picks the MOST-CONSUMED window as the binding one', () => {
+    const { rateLimit } = parseClaudeStream(RECORDED_RATE_LIMIT_EVENT);
+    // Parking until five_hour reset would return while seven_day is still
+    // capped; parking until the least-consumed window is simply wrong.
+    expect(bindingResetAtMs(rateLimit)).toBe(1788328800 * 1000);
+  });
+
+  it('returns undefined with no windows, leaving the caller to default', () => {
+    expect(bindingResetAtMs(undefined)).toBeUndefined();
+    expect(bindingResetAtMs({ windows: [] })).toBeUndefined();
   });
 });
