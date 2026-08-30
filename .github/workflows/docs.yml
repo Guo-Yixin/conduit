@@ -75,15 +75,39 @@ jobs:
       # installed drift) still gets the same verdict here.
       - name: Check documentation freshness (same check as the pre-commit hook)
         env:
-          BASE_SHA: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || github.event.before }}
+          EVENT_NAME: ${{ github.event_name }}
+          BASE_REF: ${{ github.event.pull_request.base.ref }}
+          PUSH_BEFORE: ${{ github.event.before }}
         run: |
           set -eu
+          # NOT github.event.pull_request.base.sha. That is the commit the branch
+          # FORKED FROM, so everything the base branch merged in the meantime
+          # counts as this PR's changes — which made this very PR accountable for
+          # a stale anchor introduced by #2 on main. That is precisely the
+          # "blocking work that had nothing to do with it" failure the scoping
+          # exists to prevent, so getting the base wrong quietly undoes it.
+          #
+          # On a pull_request, checkout gives the MERGE commit (base tip + PR
+          # head), so the base tip is HEAD^1. If something checked out the PR
+          # head directly instead (no second parent), the merge-base with the
+          # base branch is the right answer and gives the same diff, because that
+          # head does not contain the base's later commits either way.
+          if [ "$EVENT_NAME" = "pull_request" ]; then
+            if git rev-parse --verify -q HEAD^2 >/dev/null; then
+              BASE_SHA=$(git rev-parse HEAD^1)
+            else
+              BASE_SHA=$(git merge-base "origin/${BASE_REF:-main}" HEAD)
+            fi
+          else
+            BASE_SHA="$PUSH_BEFORE"
+          fi
           # A first push to a new branch reports an all-zero "before" SHA, and a
-          # force-push can leave a base that is no longer an ancestor. Fall back
-          # to the merge-base with the default branch, then to HEAD~1.
+          # force-push can leave a base that is no longer an ancestor. HEAD~1 is
+          # the only fallback that is right on a push to the base branch itself,
+          # where a merge-base against that branch would just return HEAD.
           if [ -z "${BASE_SHA:-}" ] || [ "$BASE_SHA" = "0000000000000000000000000000000000000000" ] \
              || ! git cat-file -e "$BASE_SHA^{commit}" 2>/dev/null; then
-            BASE_SHA=$(git merge-base origin/main HEAD 2>/dev/null || git rev-parse HEAD~1)
+            BASE_SHA=$(git rev-parse HEAD~1)
           fi
           echo "Comparing against $BASE_SHA"
           # ACMD + --no-renames + -z, matching .githooks/pre-commit exactly. A
