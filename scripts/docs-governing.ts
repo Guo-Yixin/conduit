@@ -12,13 +12,20 @@
  * So we prefix-match the target column of drift.lock instead: any binding whose
  * target is the file itself or `<file>#Symbol` counts as governing that file.
  *
- * Usage:  bun scripts/docs-governing.ts [--files] <path> [<path>...]
+ * Usage:  bun scripts/docs-governing.ts [--files] [--print0] [--] <path>...
  * Output: one governing doc path per line (deduped, sorted). With `--files`,
  *         instead echoes back the subset of INPUT paths that any binding
  *         targets — used by docs-check.sh to skip `drift check` entirely when a
  *         change touches nothing bound. Both are empty for unbound input;
  *         silence is the common case and costs nothing.
- * Exit:   always 0. This routes attention; it never gates. `drift check` gates.
+ * Exit:   0 on a successful lookup, whether or not it found anything. This
+ *         routes attention; it never gates. `drift check` gates. A CRASH still
+ *         exits non-zero, and docs-check.sh treats that as a failure rather
+ *         than as an empty result — see the fail-closed note there.
+ *
+ * `--print0` NUL-terminates each output path, and `--` ends flag parsing, so a
+ * pathname containing a space, a quote, a glob character or a newline survives
+ * the round trip from `git diff -z` through this script and into `drift`.
  */
 import { readFileSync, existsSync } from 'node:fs';
 import { relative, isAbsolute } from 'node:path';
@@ -97,12 +104,49 @@ function toRepoRelative(p: string): string {
   return (isAbsolute(p) ? relative(process.cwd(), p) : p).replaceAll('\\', '/');
 }
 
+/** A parsed invocation. Exported so the argument boundary itself has coverage. */
+export interface Invocation {
+  wantFiles: boolean;
+  print0: boolean;
+  files: string[];
+}
+
+/**
+ * Leading flags, then paths. `--` ends flag parsing so a pathname that begins
+ * with a dash — or is literally named `--files` — is still treated as a path;
+ * docs-check.sh always passes it for exactly that reason.
+ */
+export function parseInvocation(argv: string[]): Invocation {
+  let wantFiles = false;
+  let print0 = false;
+  let i = 0;
+  for (; i < argv.length; i++) {
+    const arg = argv[i];
+    if (arg === '--') {
+      i++;
+      break;
+    }
+    if (arg === '--files') {
+      wantFiles = true;
+      continue;
+    }
+    if (arg === '--print0') {
+      print0 = true;
+      continue;
+    }
+    break;
+  }
+  return { wantFiles, print0, files: argv.slice(i) };
+}
+
 if (import.meta.main) {
-  const argv = process.argv.slice(2);
-  const wantFiles = argv[0] === '--files';
-  const files = (wantFiles ? argv.slice(1) : argv).map(toRepoRelative);
+  const { wantFiles, print0, files: raw } = parseInvocation(process.argv.slice(2));
+  const files = raw.map(toRepoRelative);
   if (files.length === 0 || !existsSync(LOCKFILE)) process.exit(0);
   const bindings = parseBindings(readFileSync(LOCKFILE, 'utf-8'));
   const out = wantFiles ? governedFiles(bindings, files) : docsGoverning(bindings, files);
-  if (out.length > 0) console.log(out.join('\n'));
+  if (out.length === 0) process.exit(0);
+  // NUL-TERMINATED, not NUL-separated: a trailing delimiter is what lets the
+  // reading loop treat "no output" and "one empty path" as different things.
+  process.stdout.write(print0 ? out.map((p) => `${p}\0`).join('') : `${out.join('\n')}\n`);
 }

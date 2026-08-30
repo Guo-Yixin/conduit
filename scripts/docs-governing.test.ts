@@ -7,7 +7,7 @@
  * blocks merges.
  */
 import { describe, it, expect } from 'bun:test';
-import { parseBindings, targetGoverns, docsGoverning, governedFiles } from './docs-governing';
+import { parseBindings, targetGoverns, docsGoverning, governedFiles, parseInvocation } from './docs-governing';
 
 const LOCK = `
 version = 1
@@ -118,5 +118,61 @@ describe('governedFiles', () => {
 
   it('does not report a file that merely shares a prefix with a target', () => {
     expect(governedFiles(bindings, ['src/law/contract.test.ts'])).toEqual([]);
+  });
+});
+
+describe('parseInvocation', () => {
+  it('reads flags in either order', () => {
+    expect(parseInvocation(['--files', '--print0', 'a.ts'])).toEqual({
+      wantFiles: true,
+      print0: true,
+      files: ['a.ts'],
+    });
+    expect(parseInvocation(['--print0', '--files', 'a.ts'])).toEqual({
+      wantFiles: true,
+      print0: true,
+      files: ['a.ts'],
+    });
+  });
+
+  it('defaults to doc output with newline framing', () => {
+    expect(parseInvocation(['a.ts'])).toEqual({ wantFiles: false, print0: false, files: ['a.ts'] });
+  });
+
+  it('stops parsing flags at `--`, so a path may look like one', () => {
+    // docs-check.sh always passes `--` for this reason: a repo is free to
+    // contain a file named `--files`, and git will hand it over verbatim.
+    expect(parseInvocation(['--files', '--', '--print0']).files).toEqual(['--print0']);
+    expect(parseInvocation(['--files', '--', '--print0']).print0).toBe(false);
+  });
+
+  it('keeps a leading-dash pathname intact after `--`', () => {
+    expect(parseInvocation(['--', '-weird-name.ts'])).toEqual({
+      wantFiles: false,
+      print0: false,
+      files: ['-weird-name.ts'],
+    });
+  });
+
+  it('treats the first non-flag as the start of the paths', () => {
+    expect(parseInvocation(['a.ts', '--files']).files).toEqual(['a.ts', '--files']);
+  });
+});
+
+describe('lookup is lockfile-driven, not filesystem-driven', () => {
+  const bindings = parseBindings(LOCK);
+
+  it('still resolves a DELETED target — the case --diff-filter=ACM used to drop', () => {
+    // Nothing here stats the path. That is what lets the hook pass deleted and
+    // renamed paths through: drift reports a vanished binding target as
+    // STALE (file not found), which is exactly the flag we want.
+    expect(governedFiles(bindings, ['src/law/contract.ts'])).toEqual(['src/law/contract.ts']);
+    expect(docsGoverning(bindings, ['src/law/contract.ts'])).toEqual(['SPEC.md']);
+  });
+
+  it('reports both sides of a rename when both are passed', () => {
+    // --no-renames decomposes a rename into delete + add, so the old path
+    // (bound, now missing) and the new path both reach the checker.
+    expect(docsGoverning(bindings, ['src/law/contract.ts', 'src/law/contract-v2.ts'])).toEqual(['SPEC.md']);
   });
 });

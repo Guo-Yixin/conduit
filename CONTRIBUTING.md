@@ -25,14 +25,22 @@ normative — SPEC.md states what the kernel must do — and
 govern:
 
 ```bash
-brew install fiberplane/tap/drift   # or: curl -fsSL https://drift.fp.dev/install.sh | sh
+# Pinned to the version CI installs — see .github/workflows/docs.yml. `sig` is
+# an AST fingerprint on a pre-1.0 tool, so a different local build can disagree
+# with CI about which anchors are stale. Bump both together, on purpose.
+curl -fsSL https://drift.fp.dev/install.sh | sh -s -- --version v0.10.1
 git config core.hooksPath .githooks
 ```
 
-The hook runs at commit time, scoped to your staged files, and tells you when a
-change leaves bound prose unvouched-for. It is skipped entirely when `drift` is
-not installed, so it never blocks a contributor who has not set it up; CI runs
-the same check as an advisory `docs` job.
+(`brew install fiberplane/tap/drift` works too, but the tap tracks latest and
+offers no versioned formula, so it can drift out of step with CI.)
+
+The hook runs at commit time, scoped to your staged files — additions,
+modifications, deletions and both sides of a rename, since a binding whose
+target was moved or removed is exactly what needs flagging — and tells you when
+a change leaves bound prose unvouched-for. It is skipped entirely when `drift`
+is not installed, so it never blocks a contributor who has not set it up; CI
+runs the same check as an advisory `docs` job.
 
 ## Making a change
 

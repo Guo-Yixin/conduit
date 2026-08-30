@@ -142,11 +142,22 @@ correct behaviour was specified in SPEC §6.
 Run it once per task, not once per edit. Editing a file five times does not make
 SPEC §6 say anything new.
 
-**At commit time** — enforced by `.githooks/pre-commit`, scoped to staged files:
+**At commit time** — enforced by `.githooks/pre-commit`. Two different commands,
+and the difference matters:
 
 ```bash
-bun run docs:check          # `drift check` — exits 1 on any stale anchor
+scripts/docs-check.sh <path>...   # SCOPED — only anchors bound to those paths.
+                                  # What the hook and the `docs` CI job run.
+bun run docs:check                # `drift check`, the WHOLE corpus, unscoped.
 ```
+
+The hook hands `docs-check.sh` your staged paths — including deletions and both
+sides of a rename, since a binding whose target no longer exists is precisely
+what needs flagging. Reach for `bun run docs:check` only when you want the
+repo-wide picture: unscoped, a single stale anchor anywhere fails you for drift
+you did not introduce, which is how a check earns a permanent `--no-verify`.
+The scoped form fails closed — if it cannot determine what is bound, it errors
+rather than reporting a clean bill of health.
 
 The commit is the unit here because "is this prose still true?" cannot be
 answered while the code is still moving; asking per-edit asks before the answer
@@ -154,10 +165,12 @@ exists, and invites rewriting a SPEC paragraph three times as one change
 settles.
 
 A stale anchor is an obligation, not an error. Re-read the section it names,
-then either fix the prose or confirm it still holds:
+then either fix the prose or confirm it still holds — re-stamping **the document
+the check named**, which is not always `SPEC.md` (`CLAUDE.md` and
+`docs/installation.md` carry anchors too):
 
 ```bash
-drift link SPEC.md --doc-is-still-accurate
+drift link <doc> --doc-is-still-accurate     # e.g. drift link SPEC.md ...
 ```
 
 `drift link` **refuses** to re-stamp a stale anchor without that flag. Passing it

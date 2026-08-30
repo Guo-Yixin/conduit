@@ -25,6 +25,13 @@ on:
   push:
     branches: [main]
 
+# Read-only, and no credentials left in the checkout. This job reads markdown,
+# runs a third-party binary over it and reports a verdict — it never needs to
+# write to the repo, and the drift install step is external code that should not
+# inherit a usable token.
+permissions:
+  contents: read
+
 jobs:
   docs:
     name: docs
@@ -36,6 +43,7 @@ jobs:
           # drift's JSON output attributes stale anchors via git blame, which
           # needs full history. Staleness detection itself does not.
           fetch-depth: 0
+          persist-credentials: false
 
       - uses: oven-sh/setup-bun@v2
         with:
@@ -51,8 +59,13 @@ jobs:
       # action defaults to version:latest; on a pre-1.0 tool whose signatures
       # are AST fingerprints, floating the version invites a repo-wide false
       # staleness event on a PR that changed nothing. Bump both on purpose.
+      #
+      # The ref is a COMMIT SHA, not the tag: a tag is mutable, and this step
+      # runs third-party code. CONTRIBUTING.md pins the local installer to the
+      # same v0.10.1 so the hook and this backstop cannot reach different
+      # verdicts from different drift builds.
       - name: Install drift
-        uses: fiberplane/drift@v0.10.1
+        uses: fiberplane/drift@fc90540acb1a3f15ab3c90b4c8c9bac16c7a6522 # v0.10.1
         with:
           version: v0.10.1
 
@@ -73,10 +86,16 @@ jobs:
             BASE_SHA=$(git merge-base origin/main HEAD 2>/dev/null || git rev-parse HEAD~1)
           fi
           echo "Comparing against $BASE_SHA"
-          changed=$(git diff --name-only --diff-filter=ACM "$BASE_SHA" HEAD)
-          [ -n "$changed" ] || { echo "no files changed"; exit 0; }
-          # shellcheck disable=SC2086
-          scripts/docs-check.sh $changed
+          # ACMD + --no-renames + -z, matching .githooks/pre-commit exactly. A
+          # deleted or renamed binding target is a STALE anchor (file not
+          # found); --diff-filter=ACM dropped it, and an unquoted list would
+          # split a pathname containing a space into two non-matching paths.
+          changed=()
+          while IFS= read -r -d '' path; do
+            changed+=("$path")
+          done < <(git diff -z --name-only --no-renames --diff-filter=ACMD "$BASE_SHA" HEAD)
+          [ "${#changed[@]}" -gt 0 ] || { echo "no files changed"; exit 0; }
+          scripts/docs-check.sh "${changed[@]}"
 
       # Informational only: surfaces anchors that were ALREADY stale on main
       # before this PR. Never fails the job — this PR is not accountable for
@@ -89,5 +108,9 @@ jobs:
       - name: Typecheck the docs tooling
         run: bun run typecheck:scripts
 
-      - name: Test the docs reverse-lookup
-        run: bun test scripts/docs-governing.test.ts
+      # Covers the reverse-lookup AND the changed-file plumbing that feeds it —
+      # docs-check.test.ts runs the git-diff command lifted straight out of
+      # .githooks/pre-commit, so a regression there fails here rather than
+      # silently shrinking what the check ever sees.
+      - name: Test the docs tooling
+        run: bun test scripts/
