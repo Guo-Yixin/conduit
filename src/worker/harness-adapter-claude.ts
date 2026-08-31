@@ -129,7 +129,16 @@ interface ParsedClaudeStream {
  */
 export function parseClaudeStream(stdout: string): ParsedClaudeStream {
   let result: ClaudeResultPayload | null = null;
-  let rateLimit: RateLimitSnapshot | undefined;
+  // ACCUMULATED ACROSS EVENTS, keyed by window name. The flat payload carries
+  // ONE window per event, so a stream reporting five_hour and seven_day
+  // separately would otherwise keep only whichever arrived last — and since
+  // bindingResetAtMs parks until the MOST-CONSUMED window resets, dropping one
+  // can silently pick the wrong reset. Later readings override earlier ones for
+  // the same name.
+  const windowsByName = new Map<string, RateLimitWindow>();
+  let rateLimitStatus: string | undefined;
+  let rateLimitOverage: boolean | undefined;
+  let sawRateLimitEvent = false;
 
   for (const line of stdout.split('\n')) {
     const trimmed = line.trim();
@@ -151,31 +160,36 @@ export function parseClaudeStream(stdout: string): ParsedClaudeStream {
       const info = (event as ClaudeRateLimitEvent).rate_limit_info;
       if (info === undefined) continue;
 
+      sawRateLimitEvent = true;
+      if (info.status !== undefined) rateLimitStatus = info.status;
+      if (info.isUsingOverage !== undefined) rateLimitOverage = info.isUsingOverage;
+
       // FLAT FIRST — this is the shape the CLI emits. resetsAt is epoch SECONDS
       // on the wire; everything downstream works in milliseconds.
-      const windows: RateLimitWindow[] = [];
+      const fromThisEvent = new Set<string>();
       if (typeof info.utilization === 'number' && typeof info.resetsAt === 'number') {
-        windows.push({
-          name: info.rateLimitType ?? 'window',
-          utilization: info.utilization,
-          resetsAtMs: info.resetsAt * 1000,
-        });
+        const name = info.rateLimitType ?? 'window';
+        fromThisEvent.add(name);
+        windowsByName.set(name, { name, utilization: info.utilization, resetsAtMs: info.resetsAt * 1000 });
       }
-      // Nested fallback, for a build that reports every window at once. Merged
-      // rather than replacing, so a payload carrying both is not halved.
+      // Nested fallback, for a build that reports every window at once. The
+      // flat entry wins WITHIN one event (it is this event's own subject);
+      // across events, the later reading wins.
       for (const [name, w] of Object.entries(info.unifiedWindows ?? {})) {
         if (typeof w.utilization !== 'number' || typeof w.resetsAt !== 'number') continue;
-        if (windows.some((existing) => existing.name === name)) continue;
-        windows.push({ name, utilization: w.utilization, resetsAtMs: w.resetsAt * 1000 });
+        if (fromThisEvent.has(name)) continue;
+        windowsByName.set(name, { name, utilization: w.utilization, resetsAtMs: w.resetsAt * 1000 });
       }
-
-      rateLimit = {
-        ...(info.status !== undefined ? { status: info.status } : {}),
-        ...(info.isUsingOverage !== undefined ? { usingOverage: info.isUsingOverage } : {}),
-        windows,
-      };
     }
   }
+  const rateLimit: RateLimitSnapshot | undefined = sawRateLimitEvent
+    ? {
+        ...(rateLimitStatus !== undefined ? { status: rateLimitStatus } : {}),
+        ...(rateLimitOverage !== undefined ? { usingOverage: rateLimitOverage } : {}),
+        windows: [...windowsByName.values()],
+      }
+    : undefined;
+
   return { result, rateLimit };
 }
 

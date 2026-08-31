@@ -510,6 +510,43 @@ describe('parseClaudeStream / bindingResetAtMs', () => {
     expect(rateLimit?.windows[0]?.utilization).toBe(0.77);
   });
 
+  it('ACCUMULATES windows reported across separate events', () => {
+    // The flat payload carries ONE window per event, so a run reporting
+    // five_hour and seven_day separately would keep only whichever arrived
+    // last. Since the park targets the MOST-CONSUMED window, dropping one
+    // silently picks the wrong reset — here it would park until the five_hour
+    // reset while the seven_day cap is the one actually blocking.
+    const fiveHour = JSON.stringify({
+      type: 'rate_limit_event',
+      rate_limit_info: { status: 'allowed', rateLimitType: 'five_hour', utilization: 0.06, resetsAt: 1788125400 },
+    });
+    const { rateLimit } = parseClaudeStream([fiveHour, RECORDED_RATE_LIMIT_EVENT].join('\n'));
+
+    expect(rateLimit?.windows).toHaveLength(2);
+    expect(bindingResetAtMs(rateLimit)).toBe(1788328800 * 1000);
+  });
+
+  it('keeps the LATEST reading for a window reported twice', () => {
+    const early = JSON.stringify({
+      type: 'rate_limit_event',
+      rate_limit_info: { rateLimitType: 'seven_day', utilization: 0.10, resetsAt: 1788000000 },
+    });
+    const { rateLimit } = parseClaudeStream([early, RECORDED_RATE_LIMIT_EVENT].join('\n'));
+
+    expect(rateLimit?.windows).toHaveLength(1);
+    expect(rateLimit?.windows[0]?.utilization).toBe(0.77);
+  });
+
+  it('carries the latest status forward across events', () => {
+    const early = JSON.stringify({
+      type: 'rate_limit_event',
+      rate_limit_info: { status: 'allowed', rateLimitType: 'five_hour', utilization: 0.01, resetsAt: 1788125400 },
+    });
+    const { rateLimit } = parseClaudeStream([early, RECORDED_RATE_LIMIT_EVENT].join('\n'));
+
+    expect(rateLimit?.status).toBe('allowed_warning');
+  });
+
   it('still reads the NESTED form, picking the most-consumed window', () => {
     // Parking until the five_hour reset would return while seven_day is still
     // capped, so the binding window is the one nearest its ceiling.
