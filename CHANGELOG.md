@@ -24,9 +24,12 @@ historical context, not public releases or public repository history.
   `--output-format stream-json --verbose`, whose `rate_limit_event` records
   per-window utilization and reset times as journal attributes — so "what
   fraction of spend is cache reads" and "what did this run draw against the
-  plan" are queries rather than inferences. Additive and nullable: existing
-  journals migrate in place, pre-split rows stay readable, and run/wave budgets
-  still count the same totals (they sum all four columns).
+  plan" are queries rather than inferences. `model` is attributed to the model
+  that consumed the most tokens, since a normal agentic call bills two or more.
+  The stream is filtered line-by-line as it arrives, so reading these events
+  does not hold an entire multi-minute agent transcript in memory. Additive and
+  nullable: existing journals migrate in place, pre-split rows stay readable,
+  and run/wave budgets still count the same totals (they sum all four columns).
 
 ### Fixed
 
@@ -44,7 +47,11 @@ historical context, not public releases or public repository history.
   future `release_at` no longer trips the liveness watchdog as a stall — which
   also fixes a latent bug for fan-out staggers longer than
   `no_progress_minutes` — while the consumption andon still halts a run that
-  cannot afford to wait the cap out.
+  cannot afford to wait the cap out. A single park is capped at one hour, so a
+  reset hours away re-checks the budget and refreshes its estimate rather than
+  becoming one long blocking sleep. Under the default 10-minute run budget a
+  capped run halts on wall clock; what fixes #3 is that the card stays `ready`
+  rather than terminal, so `conduit resume` has something to dispatch.
 
 - Scoped the bounded-rework cap to each gate instead of the whole card
   ([#1](https://github.com/theaiteam-dev/conduit/issues/1)). `rework_cap` is

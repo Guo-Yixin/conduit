@@ -131,6 +131,24 @@ const DEFAULT_HARNESS_TIMEOUT_MS = 5 * 60 * 1000;
 const DEFAULT_RATE_LIMIT_PARK_SECONDS = 5 * 60;
 
 /**
+ * Longest a SINGLE park may be, regardless of how far out the provider's reset
+ * is.
+ *
+ * A real session cap can reset hours away, and the run loop's release-gate wait
+ * is a blocking sleep — so an uncapped park is a literal multi-hour `sleep()`
+ * inside the executor. That should be a decision, not a side effect of trusting
+ * whatever the provider reported.
+ *
+ * Capping it costs one extra CLI call per hour while a cap persists (the card
+ * wakes, is capped again, re-parks) and buys three things: the consumption andon
+ * is re-evaluated each time rather than once before a long sleep, the reset
+ * estimate is refreshed instead of trusted for hours, and a run that is going
+ * to halt on wall clock does so promptly rather than after sleeping through the
+ * budget it had already exhausted.
+ */
+const MAX_RATE_LIMIT_PARK_SECONDS = 60 * 60;
+
+/**
  * Convert a provider's absolute reset instant into a `cards.release_at` value.
  *
  * UNITS AND CLOCKS, both of which matter. `release_at` is compared against the
@@ -154,7 +172,7 @@ export function releaseAtForRateLimit(
     resetAtMs !== undefined && resetAtMs > realNowMs
       ? Math.ceil((resetAtMs - realNowMs) / 1000)
       : DEFAULT_RATE_LIMIT_PARK_SECONDS;
-  return injectedNowSeconds + remainingSeconds;
+  return injectedNowSeconds + Math.min(remainingSeconds, MAX_RATE_LIMIT_PARK_SECONDS);
 }
 
 /**

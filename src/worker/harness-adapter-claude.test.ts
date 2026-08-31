@@ -36,6 +36,8 @@ import {
   createClaudeHarnessAdapter,
   parseClaudeStream,
   bindingResetAtMs,
+  isRateLimited,
+  dominantModel,
   type ClaudeHarnessAdapterConfig,
 } from './harness-adapter-claude';
 import type {
@@ -375,7 +377,31 @@ const RECORDED_RATE_LIMITED = JSON.stringify({
   total_cost_usd: 0,
 });
 
+/**
+ * A rate_limit_event CAPTURED FROM THE REAL CLI (2.1.226). The shape is FLAT —
+ * one window per event, fields at the top level, named by `rateLimitType`.
+ *
+ * The earlier version of this fixture was hand-built in a nested
+ * `unifiedWindows` shape the CLI does not emit, so the parser and the test
+ * agreed with each other and neither agreed with reality: `windows` came back
+ * empty on every real call, the reported reset was never used, and the park
+ * silently fell back to its default interval.
+ */
 const RECORDED_RATE_LIMIT_EVENT = JSON.stringify({
+  type: 'rate_limit_event',
+  rate_limit_info: {
+    status: 'allowed_warning',
+    resetsAt: 1788328800,
+    rateLimitType: 'seven_day',
+    utilization: 0.77,
+    isUsingOverage: false,
+    surpassedThreshold: 0.75,
+  },
+  session_id: '2f7c8b1e-uuid',
+});
+
+/** The nested form, kept working as a fallback for builds that emit it. */
+const RECORDED_RATE_LIMIT_EVENT_NESTED = JSON.stringify({
   type: 'rate_limit_event',
   rate_limit_info: {
     status: 'allowed_warning',
@@ -458,7 +484,10 @@ describe('parseClaudeStream / bindingResetAtMs', () => {
     const parsed = parseClaudeStream(stdout);
     expect(parsed.result?.total_cost_usd).toBe(0.0123);
     expect(parsed.rateLimit?.status).toBe('allowed_warning');
-    expect(parsed.rateLimit?.windows).toHaveLength(2);
+    // The real event carries exactly ONE window.
+    expect(parsed.rateLimit?.windows).toEqual([
+      { name: 'seven_day', utilization: 0.77, resetsAtMs: 1788328800 * 1000 },
+    ]);
   });
 
   it('skips a malformed line rather than failing the whole invocation', () => {
@@ -473,15 +502,93 @@ describe('parseClaudeStream / bindingResetAtMs', () => {
     expect(parseClaudeStream(JSON.stringify({ type: 'system' })).result).toBeNull();
   });
 
-  it('picks the MOST-CONSUMED window as the binding one', () => {
+  it('reads the FLAT window the real CLI emits', () => {
+    // The regression: against the nested-only parser this returned undefined on
+    // every real call, so the park never used the provider's reported reset.
     const { rateLimit } = parseClaudeStream(RECORDED_RATE_LIMIT_EVENT);
-    // Parking until five_hour reset would return while seven_day is still
-    // capped; parking until the least-consumed window is simply wrong.
+    expect(bindingResetAtMs(rateLimit)).toBe(1788328800 * 1000);
+    expect(rateLimit?.windows[0]?.utilization).toBe(0.77);
+  });
+
+  it('still reads the NESTED form, picking the most-consumed window', () => {
+    // Parking until the five_hour reset would return while seven_day is still
+    // capped, so the binding window is the one nearest its ceiling.
+    const { rateLimit } = parseClaudeStream(RECORDED_RATE_LIMIT_EVENT_NESTED);
+    expect(rateLimit?.windows).toHaveLength(2);
     expect(bindingResetAtMs(rateLimit)).toBe(1788328800 * 1000);
   });
 
   it('returns undefined with no windows, leaving the caller to default', () => {
     expect(bindingResetAtMs(undefined)).toBeUndefined();
     expect(bindingResetAtMs({ windows: [] })).toBeUndefined();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Review follow-ups: classification that degrades safely, and model attribution
+// that survives the normal multi-model case.
+// ---------------------------------------------------------------------------
+
+describe('isRateLimited', () => {
+  it('trusts the structured 429 first', () => {
+    expect(isRateLimited({ api_error_status: 429 }, undefined, '', '')).toBe(true);
+  });
+
+  it('parks when the CLI exits with NO result event but a blocked status', () => {
+    // The scenario that would otherwise leave #3 open under the exact condition
+    // it was filed for: no result event means api_error_status is unreadable,
+    // and an untagged throw scraps the card.
+    expect(isRateLimited(null, { status: 'blocked', windows: [] }, '', '')).toBe(true);
+  });
+
+  it('falls back to the result text when nothing structured says so', () => {
+    expect(isRateLimited({ result: "You've hit your session limit" }, undefined, '', '')).toBe(true);
+  });
+
+  it('reads stderr text only when stdout produced nothing at all', () => {
+    expect(isRateLimited(null, undefined, '', 'Error: 429 Too Many Requests')).toBe(true);
+    // With stdout present, the transcript is NOT text-matched: an agent that
+    // merely read a file mentioning rate limits must not park the card.
+    expect(isRateLimited(null, undefined, '{"type":"assistant"}', 'rate limit')).toBe(false);
+  });
+
+  it('does NOT park on allowed_warning — approaching a cap is not being stopped', () => {
+    expect(isRateLimited(null, { status: 'allowed_warning', windows: [] }, '', '')).toBe(false);
+  });
+
+  it('does not park an ordinary crash', () => {
+    expect(isRateLimited({ terminal_reason: 'refusal', result: 'nope' }, undefined, '', 'segfault')).toBe(false);
+  });
+});
+
+describe('dominantModel', () => {
+  it('attributes to the model that consumed the most tokens', () => {
+    // TWO OR MORE entries is the NORMAL case: Claude Code bills a haiku model
+    // for side tasks alongside the main model, so even a trivial call returns
+    // two. Requiring exactly one left the column empty on essentially every row.
+    expect(
+      dominantModel({
+        'claude-haiku-4-5-20251001': { canonicalModel: 'claude-haiku-4-5-20251001', inputTokens: 10, outputTokens: 5 },
+        'claude-opus-5': { canonicalModel: 'claude-opus-5', inputTokens: 2, outputTokens: 4, cacheReadInputTokens: 26_696 },
+      }),
+    ).toBe('claude-opus-5');
+  });
+
+  it('counts cache tokens toward the share, not just fresh input', () => {
+    expect(
+      dominantModel({
+        a: { canonicalModel: 'a', inputTokens: 500 },
+        b: { canonicalModel: 'b', inputTokens: 1, cacheReadInputTokens: 900 },
+      }),
+    ).toBe('b');
+  });
+
+  it('falls back to the key when canonicalModel is absent', () => {
+    expect(dominantModel({ 'some-model': { inputTokens: 1 } })).toBe('some-model');
+  });
+
+  it('is undefined when nothing was reported', () => {
+    expect(dominantModel(undefined)).toBeUndefined();
+    expect(dominantModel({})).toBeUndefined();
   });
 });

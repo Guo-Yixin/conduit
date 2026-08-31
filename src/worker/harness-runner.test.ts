@@ -258,3 +258,79 @@ describe('harness runner: timeout/natural-exit boundary race (AC2 regression)', 
     expect(falseTimeouts).toEqual([]);
   }, 180_000);
 });
+
+// ---------------------------------------------------------------------------
+// stdoutLineFilter — keep the events we read, discard the transcript.
+// ---------------------------------------------------------------------------
+
+describe('harness runner: stdout line filter', () => {
+  const keepResult = (line: string) => line.includes('"type":"result"');
+
+  it('retains only matching lines and drops the rest', async () => {
+    const result = await runHarnessProcess(
+      {
+        command: 'sh',
+        args: ['-c', 'printf \'{"type":"assistant"}\\n{"type":"result","ok":1}\\n{"type":"tool"}\\n\''],
+      },
+      config({ timeoutMs: 5_000, stdoutLineFilter: keepResult }),
+    );
+
+    expect(result.stdout).toBe('{"type":"result","ok":1}');
+  });
+
+  it('keeps a final line with no trailing newline — a crashed stream rarely has one', async () => {
+    const result = await runHarnessProcess(
+      { command: 'sh', args: ['-c', 'printf \'{"type":"noise"}\\n{"type":"result","ok":2}\''] },
+      config({ timeoutMs: 5_000, stdoutLineFilter: keepResult }),
+    );
+
+    expect(result.stdout).toBe('{"type":"result","ok":2}');
+  });
+
+  it('does not hold the discarded bulk — the point of filtering at all', async () => {
+    // A stream-json run that merely read two files measured 57KB against a 2KB
+    // result event, and that ratio grows with every tool call across a station
+    // that can run 8-17 minutes. Here ~2MB of transcript is thrown away while
+    // the one line we need survives intact.
+    const result = await runHarnessProcess(
+      {
+        command: 'sh',
+        args: [
+          '-c',
+          'i=0; while [ $i -lt 2000 ]; do printf \'{"type":"assistant","text":"%01000d"}\\n\' $i; i=$((i+1)); done; printf \'{"type":"result","ok":3}\\n\'',
+        ],
+      },
+      config({ timeoutMs: 20_000, stdoutLineFilter: keepResult }),
+    );
+
+    expect(result.stdout).toBe('{"type":"result","ok":3}');
+    expect(result.stdout.length).toBeLessThan(200);
+  });
+
+  it('reassembles a line split across chunk boundaries', async () => {
+    // Large lines arrive in several reads; a naive per-chunk split would lose
+    // or corrupt the event straddling the boundary.
+    // Built inside the child: a 200KB literal in argv exceeds the exec limit.
+    const result = await runHarnessProcess(
+      {
+        command: 'sh',
+        args: [
+          '-c',
+          'printf \'{"type":"result","pad":"\'; head -c 200000 /dev/zero | tr \'\\0\' \'x\'; printf \'"}\\n\'',
+        ],
+      },
+      config({ timeoutMs: 20_000, stdoutLineFilter: keepResult }),
+    );
+
+    expect(JSON.parse(result.stdout)).toMatchObject({ type: 'result' });
+  });
+
+  it('buffers everything when no filter is given (unchanged default)', async () => {
+    const result = await runHarnessProcess(
+      { command: 'sh', args: ['-c', 'printf \'a\\nb\\n\''] },
+      config({ timeoutMs: 5_000 }),
+    );
+
+    expect(result.stdout).toBe('a\nb\n');
+  });
+});

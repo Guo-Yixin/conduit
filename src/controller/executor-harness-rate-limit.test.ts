@@ -457,6 +457,19 @@ describe('releaseAtForRateLimit', () => {
     expect(releaseAtForRateLimit(1000, REAL_NOW_MS - 60_000, REAL_NOW_MS)).toBe(1300);
   });
 
+  it('CAPS a single park, so a hours-away reset is not one long blocking sleep', () => {
+    // A real session cap can reset many hours out, and the release-gate wait is
+    // a blocking sleep. Capping at an hour re-checks the consumption andon and
+    // refreshes the reset estimate instead of trusting one reading for a whole
+    // afternoon; the card simply re-parks if it is still capped.
+    const FIFTY_FOUR_HOURS_MS = 54 * 60 * 60 * 1000;
+    expect(releaseAtForRateLimit(1000, REAL_NOW_MS + FIFTY_FOUR_HOURS_MS, REAL_NOW_MS)).toBe(1000 + 3600);
+  });
+
+  it('leaves a reset INSIDE the cap exactly as reported', () => {
+    expect(releaseAtForRateLimit(1000, REAL_NOW_MS + 600_000, REAL_NOW_MS)).toBe(1600);
+  });
+
   it('never returns an epoch-scale value from an epoch-scale input', () => {
     // The bug this guards: writing resetAtMs straight through parked cards
     // roughly fifty thousand years out, and they were never dispatched again.

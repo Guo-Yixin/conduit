@@ -45,6 +45,10 @@ interface ClaudeUsagePayload {
 
 interface ClaudeModelUsageEntry {
   canonicalModel?: string;
+  inputTokens?: number;
+  outputTokens?: number;
+  cacheReadInputTokens?: number;
+  cacheCreationInputTokens?: number;
 }
 
 interface ClaudeResultPayload {
@@ -72,14 +76,39 @@ interface ClaudeRateLimitWindow {
   resetsAt?: number;
 }
 
+/**
+ * `rate_limit_info` as the CLI actually emits it: ONE window per event, with
+ * its fields FLAT at the top level and named by `rateLimitType`.
+ *
+ * `unifiedWindows` is kept as a fallback because some builds have been observed
+ * carrying it, but the flat form is the one that must work — writing this
+ * against the nested shape alone meant `windows` came back empty on every real
+ * call, so the park silently fell back to its default interval and the
+ * provider's own reset was never used.
+ */
 interface ClaudeRateLimitEvent {
   type?: string;
   rate_limit_info?: {
     status?: string;
     isUsingOverage?: boolean;
+    /** Names the single flat window, e.g. 'five_hour' | 'seven_day'. */
+    rateLimitType?: string;
+    utilization?: number;
+    /** Epoch SECONDS. */
+    resetsAt?: number;
     unifiedWindows?: Record<string, ClaudeRateLimitWindow>;
   };
 }
+
+/**
+ * The only two event types this adapter reads, matched on the RAW line so the
+ * stream can be filtered without parsing (or retaining) the rest.
+ *
+ * A false positive — an assistant message quoting this text — is harmless:
+ * parseClaudeStream still checks the real `type` field. A false NEGATIVE would
+ * lose the result, so the pattern is deliberately loose about whitespace.
+ */
+const CLAUDE_KEPT_EVENT = /"type"\s*:\s*"(result|rate_limit_event)"/;
 
 /** What one invocation's NDJSON stream yielded. */
 interface ParsedClaudeStream {
@@ -121,11 +150,25 @@ export function parseClaudeStream(stdout: string): ParsedClaudeStream {
     if (type === 'rate_limit_event') {
       const info = (event as ClaudeRateLimitEvent).rate_limit_info;
       if (info === undefined) continue;
-      const windows: RateLimitWindow[] = Object.entries(info.unifiedWindows ?? {})
-        .filter(([, w]) => typeof w.utilization === 'number' && typeof w.resetsAt === 'number')
-        // resetsAt is epoch SECONDS on the wire; everything downstream (
-        // cards.release_at, the run loop's sleep) is milliseconds.
-        .map(([name, w]) => ({ name, utilization: w.utilization!, resetsAtMs: w.resetsAt! * 1000 }));
+
+      // FLAT FIRST — this is the shape the CLI emits. resetsAt is epoch SECONDS
+      // on the wire; everything downstream works in milliseconds.
+      const windows: RateLimitWindow[] = [];
+      if (typeof info.utilization === 'number' && typeof info.resetsAt === 'number') {
+        windows.push({
+          name: info.rateLimitType ?? 'window',
+          utilization: info.utilization,
+          resetsAtMs: info.resetsAt * 1000,
+        });
+      }
+      // Nested fallback, for a build that reports every window at once. Merged
+      // rather than replacing, so a payload carrying both is not halved.
+      for (const [name, w] of Object.entries(info.unifiedWindows ?? {})) {
+        if (typeof w.utilization !== 'number' || typeof w.resetsAt !== 'number') continue;
+        if (windows.some((existing) => existing.name === name)) continue;
+        windows.push({ name, utilization: w.utilization, resetsAtMs: w.resetsAt * 1000 });
+      }
+
       rateLimit = {
         ...(info.status !== undefined ? { status: info.status } : {}),
         ...(info.isUsingOverage !== undefined ? { usingOverage: info.isUsingOverage } : {}),
@@ -134,6 +177,66 @@ export function parseClaudeStream(stdout: string): ParsedClaudeStream {
     }
   }
   return { result, rateLimit };
+}
+
+/** Total tokens a modelUsage entry accounts for, across every class. */
+function entryTokens(entry: ClaudeModelUsageEntry): number {
+  return (
+    (entry.inputTokens ?? 0) +
+    (entry.outputTokens ?? 0) +
+    (entry.cacheReadInputTokens ?? 0) +
+    (entry.cacheCreationInputTokens ?? 0)
+  );
+}
+
+/**
+ * The model that did the bulk of the work, or undefined if none is reported.
+ *
+ * Ties break toward the first entry, which keeps the label stable rather than
+ * dependent on key order.
+ */
+export function dominantModel(
+  modelUsage: Record<string, ClaudeModelUsageEntry> | undefined,
+): string | undefined {
+  let best: { model: string; tokens: number } | undefined;
+  for (const [key, entry] of Object.entries(modelUsage ?? {})) {
+    const model = entry.canonicalModel ?? key;
+    const tokens = entryTokens(entry);
+    if (best === undefined || tokens > best.tokens) best = { model, tokens };
+  }
+  return best?.model;
+}
+
+/**
+ * Blocking rate-limit states. `allowed_warning` is NOT one of them — it means
+ * approaching a ceiling, not stopped at it, and treating it as a cap would park
+ * cards that could still run.
+ */
+const BLOCKED_RATE_LIMIT_STATUSES = new Set(['blocked', 'rejected', 'exhausted', 'rate_limited']);
+
+/** Phrasing the CLI uses when a subscription or session cap is what stopped it. */
+const RATE_LIMIT_TEXT = /rate limit|rate_limit|session limit|usage limit|too many requests|\b429\b/i;
+
+/**
+ * Did this failed invocation fail because of a provider cap?
+ *
+ * Ordered most to least authoritative. The structured status is the only one
+ * confirmed against a genuine cap; the other two exist so that a CLI which
+ * reports the same condition differently still parks rather than scraps.
+ */
+export function isRateLimited(
+  payload: ClaudeResultPayload | null,
+  rateLimit: RateLimitSnapshot | undefined,
+  stdout: string,
+  stderr: string,
+): boolean {
+  if (payload?.api_error_status === 429) return true;
+  if (rateLimit?.status !== undefined && BLOCKED_RATE_LIMIT_STATUSES.has(rateLimit.status)) return true;
+  // Text is the LAST resort and only over the result field or a short stderr —
+  // never the whole transcript, which could contain the phrase incidentally in
+  // a tool output or a file the agent happened to read.
+  const text = payload?.result ?? (stdout.length === 0 ? stderr.slice(0, 500) : '');
+  return text.length > 0 && RATE_LIMIT_TEXT.test(text);
 }
 
 /**
@@ -219,6 +322,10 @@ export function createClaudeHarnessAdapter(config: ClaudeHarnessAdapterConfig): 
           projectRoot: config.projectRoot,
           timeoutMs: call.timeoutMs,
           envAllowlist: config.envAllowlist,
+          // stream-json carries the whole agent transcript; we need two events
+          // from it. Filtering as it arrives keeps a long station's memory
+          // proportional to what we actually read, not to how much it did.
+          stdoutLineFilter: (line) => CLAUDE_KEPT_EVENT.test(line),
         },
       );
 
@@ -239,10 +346,17 @@ export function createClaudeHarnessAdapter(config: ClaudeHarnessAdapterConfig): 
         // and spending the card's remaining attempts on it in a few seconds is
         // what destroyed whole runs. Tag it distinctly so the executor can park
         // the card instead of burning the budget.
-        if (payload?.api_error_status === 429) {
+        //
+        // THREE signals, deliberately, because only the first is confirmed
+        // against a real cap. If the CLI ever exits WITHOUT a terminal result
+        // event, keying solely on api_error_status would throw untagged and
+        // scrap — leaving issue #3 open under the exact condition it was filed
+        // for. Degrading into a park is the safe direction: the worst case is
+        // one short wait before the card runs again.
+        if (isRateLimited(payload, rateLimit, spawnResult.stdout, spawnResult.stderr)) {
           const resetAtMs = bindingResetAtMs(rateLimit);
           fail(
-            `provider rate limit: ${payload.result ?? 'no detail reported'}`,
+            `provider rate limit: ${payload?.result ?? rateLimit?.status ?? 'no detail reported'}`,
             'harness-rate-limited',
             {
               ...(resetAtMs !== undefined ? { resetAtMs } : {}),
@@ -285,13 +399,17 @@ export function createClaudeHarnessAdapter(config: ClaudeHarnessAdapterConfig): 
         (usage.cache_creation_input_tokens ?? 0) +
         (usage.cache_read_input_tokens ?? 0);
 
-      // modelUsage names the model the provider actually billed, which is what
-      // fills the journal's `model` column (empty on harness rows until now).
-      // One entry is the common case; with several, there is no single honest
-      // label, so leave it unset rather than pick arbitrarily.
-      const modelEntries = Object.values(payload.modelUsage ?? {});
-      const billedModel =
-        modelEntries.length === 1 ? modelEntries[0]?.canonicalModel : undefined;
+      // modelUsage names the models the provider actually billed, filling the
+      // journal's `model` column (empty on harness rows until now).
+      //
+      // TWO OR MORE entries is the NORMAL case, not the exception: Claude Code
+      // bills a haiku model for side tasks alongside the main model, so even a
+      // trivial call returns two. Requiring exactly one meant the column fell
+      // back to the station's requested model on essentially every row —
+      // delivering nothing #5 asked for. Attribute to the entry that consumed
+      // the most tokens instead: that is the model that did the work and drove
+      // the cost.
+      const billedModel = dominantModel(payload.modelUsage);
 
       return {
         outputs: [],
