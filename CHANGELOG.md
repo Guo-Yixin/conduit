@@ -11,7 +11,47 @@ historical context, not public releases or public repository history.
 
 ## [Unreleased]
 
+### Added
+
+- Journal now records the token split and provider capacity per call
+  ([#5](https://github.com/theaiteam-dev/conduit/issues/5)). `output_tokens`
+  was `0` on every priced row and `cache_read`/`cache_creation` had nowhere to
+  go, because the harness path summed all four token classes into a single
+  scalar and wrote it to `input_tokens`. The journal gains
+  `cache_read_input_tokens` and `cache_creation_input_tokens`, `input_tokens`
+  now means UNCACHED input only, and `model` is filled from what the provider
+  actually billed. The `claude-headless` adapter reads
+  `--output-format stream-json --verbose`, whose `rate_limit_event` records
+  per-window utilization and reset times as journal attributes — so "what
+  fraction of spend is cache reads" and "what did this run draw against the
+  plan" are queries rather than inferences. `model` is attributed to the model
+  that consumed the most tokens, since a normal agentic call bills two or more.
+  The stream is filtered line-by-line as it arrives, so reading these events
+  does not hold an entire multi-minute agent transcript in memory. Additive and
+  nullable: existing journals migrate in place, pre-split rows stay readable,
+  and run/wave budgets still count the same totals (they sum all four columns).
+
 ### Fixed
+
+- A provider rate limit no longer destroys a run
+  ([#3](https://github.com/theaiteam-dev/conduit/issues/3)). A 429 was
+  indistinguishable from a crash — both surfaced as `harness-nonzero-exit`,
+  because the adapter bailed on the exit code before parsing the stdout that
+  carried the diagnosis — and the retry loop had no delay, so a session cap
+  exhausted a card's whole attempt budget in about three seconds, scrapped the
+  card, and discarded the paid work from earlier attempts along with it.
+  `claude-headless` now classifies a 429 as `harness-rate-limited` and carries
+  the provider's reset time; the executor parks the card behind
+  `cards.release_at` without consuming an execution attempt, and every other
+  retryable class gets bounded exponential backoff. A card gated behind a
+  future `release_at` no longer trips the liveness watchdog as a stall — which
+  also fixes a latent bug for fan-out staggers longer than
+  `no_progress_minutes` — while the consumption andon still halts a run that
+  cannot afford to wait the cap out. A single park is capped at one hour, so a
+  reset hours away re-checks the budget and refreshes its estimate rather than
+  becoming one long blocking sleep. Under the default 10-minute run budget a
+  capped run halts on wall clock; what fixes #3 is that the card stays `ready`
+  rather than terminal, so `conduit resume` has something to dispatch.
 
 - Scoped the bounded-rework cap to each gate instead of the whole card
   ([#1](https://github.com/theaiteam-dev/conduit/issues/1)). `rework_cap` is

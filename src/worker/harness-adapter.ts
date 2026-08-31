@@ -53,11 +53,69 @@ export interface ProducedOutput {
 }
 
 /**
- * Per-call usage signal. Either structured {tokens,cost}, or an explicit
+ * The four token classes a call can consume, reported separately (issue #5).
+ *
+ * `inputTokens` is UNCACHED input only. Before this split every class was summed
+ * into a single scalar that the executor then wrote to the journal's
+ * `input_tokens` with `output_tokens` hard-coded to 0 — so `output_tokens` was
+ * never populated on any row, and the cache-read fraction (the majority of real
+ * spend) was not derivable at all.
+ */
+export interface UsageBreakdown {
+  /** Fresh, uncached input. */
+  inputTokens: number;
+  outputTokens: number;
+  cacheReadInputTokens: number;
+  cacheCreationInputTokens: number;
+}
+
+/** One provider rate-limit window as reported alongside a call. */
+export interface RateLimitWindow {
+  /** Provider's name for the window, e.g. 'five_hour', 'seven_day'. */
+  name: string;
+  /** Fraction of the window consumed, 0..1. */
+  utilization: number;
+  /** When the window resets, epoch milliseconds. */
+  resetsAtMs: number;
+}
+
+/**
+ * Provider capacity at the moment of a call, when the harness reports it.
+ *
+ * `status` moves through a warning state before a cap is actually hit, which is
+ * the difference between seeing a wall coming and discovering it as a 1-second
+ * failed attempt.
+ */
+export interface RateLimitSnapshot {
+  status?: string;
+  usingOverage?: boolean;
+  windows: RateLimitWindow[];
+}
+
+/** Structured usage for one call. */
+export interface KnownUsage {
+  /**
+   * TOTAL tokens across every class. This is the BUDGET AUTHORITY — run and
+   * wave budgets fold this number, so it must stay a true total even as
+   * `breakdown` splits it. Summing only breakdown.input+output would drop cache
+   * reads and silently stop the budget guards from tripping.
+   */
+  tokens: number;
+  cost: number;
+  /** The per-class split, when the adapter can report one. */
+  breakdown?: UsageBreakdown;
+  /** Model the provider actually billed, when reported (fills the `model` column). */
+  model?: string;
+  /** Provider capacity snapshot, when reported. */
+  rateLimit?: RateLimitSnapshot;
+}
+
+/**
+ * Per-call usage signal. Either structured usage, or an explicit
  * `{ unknown: true }` when the adapter cannot report usage for that call —
  * distinct from the static `reportsUsage` capability flag below.
  */
-export type UsageReport = { tokens: number; cost: number } | { unknown: true };
+export type UsageReport = KnownUsage | { unknown: true };
 
 /** What a harness adapter returns after a bounded invocation. */
 export interface HarnessResult {

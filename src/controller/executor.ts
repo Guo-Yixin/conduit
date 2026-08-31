@@ -38,13 +38,16 @@ import { deriveSubflowRunId } from '../run/run-id';
 import type { StartWorkMessage } from '../worker/ipc-protocol';
 import { sanitizeStderrTail } from '../worker/ipc-protocol';
 import type { ModelAdapter } from '../worker/adapter';
-import { DEFAULT_RUN_ID, type ConduitDB } from '../persistence/db';
+import { DEFAULT_RUN_ID, type ConduitDB, type JournalSpanInput } from '../persistence/db';
 import type { FlowConfig, StationConfig, FanInPolicyConfig, StationOutput, Card } from '../types/kernel';
 import { planTick } from './tick';
 import { attemptClaim, beginWork, renewLease, reconcile } from '../dispatch/claim';
 import { checkCommandAllowed, runDeterministic, deterministicCardEnv } from '../worker/deterministic';
 import { runTransformStation, coerciveParse, computeFindingsHash } from '../worker/transform';
-import type { HarnessRegistry, MountedInput, HarnessResult } from '../worker/harness-adapter';
+import type {
+  HarnessRegistry, MountedInput, HarnessResult, KnownUsage, RateLimitSnapshot,
+} from '../worker/harness-adapter';
+import { harnessRetryDelayMs } from '../worker/harness-retry';
 import { loadImageInput, hashImageInputs, assertImagePayloadWithinLimits } from '../worker/image-input';
 import type { ImageInput } from '../worker/image-input';
 import { renderPrompt } from '../flow/render';
@@ -117,6 +120,135 @@ const WORKER_ID_PREFIX = 'executor';
  * transform-scale timeout.
  */
 const DEFAULT_HARNESS_TIMEOUT_MS = 5 * 60 * 1000;
+
+/**
+ * How long to park a rate-limited card when the provider reported no reset time.
+ *
+ * Deliberately short. A missing reset is a gap in the signal, not evidence of a
+ * long cap, so the cheap mistake is waking early and re-parking on a fresh 429 —
+ * the expensive one is idling a run for hours on a guess.
+ */
+const DEFAULT_RATE_LIMIT_PARK_SECONDS = 5 * 60;
+
+/**
+ * Longest a SINGLE park may be, regardless of how far out the provider's reset
+ * is.
+ *
+ * A real session cap can reset hours away, and the run loop's release-gate wait
+ * is a blocking sleep — so an uncapped park is a literal multi-hour `sleep()`
+ * inside the executor. That should be a decision, not a side effect of trusting
+ * whatever the provider reported.
+ *
+ * Capping it costs one extra CLI call per hour while a cap persists (the card
+ * wakes, is capped again, re-parks) and buys three things: the consumption andon
+ * is re-evaluated each time rather than once before a long sleep, the reset
+ * estimate is refreshed instead of trusted for hours, and a run that is going
+ * to halt on wall clock does so promptly rather than after sleeping through the
+ * budget it had already exhausted.
+ */
+const MAX_RATE_LIMIT_PARK_SECONDS = 60 * 60;
+
+/**
+ * Convert a provider's absolute reset instant into a `cards.release_at` value.
+ *
+ * UNITS AND CLOCKS, both of which matter. `release_at` is compared against the
+ * INJECTED now (tick.ts), in SECONDS — that is what keeps the release gate
+ * deterministic and crash/resume-safe, exactly like the fan-out stagger's
+ * `now + staggerSeconds`. The provider, meanwhile, reports a real wall-clock
+ * epoch in milliseconds. Writing that epoch straight into the column would mix
+ * both units AND both clocks, parking the card roughly fifty thousand years out.
+ *
+ * So we take the provider's reset as a DURATION against real time, and add that
+ * duration to the kernel's own clock. A reset already in the past, or absent,
+ * falls back to the default park rather than releasing instantly into the same
+ * cap.
+ */
+export function releaseAtForRateLimit(
+  injectedNowSeconds: number,
+  resetAtMs: number | undefined,
+  realNowMs: number,
+): number {
+  const remainingSeconds =
+    resetAtMs !== undefined && resetAtMs > realNowMs
+      ? Math.ceil((resetAtMs - realNowMs) / 1000)
+      : DEFAULT_RATE_LIMIT_PARK_SECONDS;
+  return injectedNowSeconds + Math.min(remainingSeconds, MAX_RATE_LIMIT_PARK_SECONDS);
+}
+
+/**
+ * Map an adapter's structured usage onto the journal's columns (issue #5).
+ *
+ * WITHOUT a breakdown this reproduces the pre-#5 shape exactly — the total in
+ * `inputTokens`, `outputTokens` 0, cache columns left NULL — so an adapter that
+ * cannot split its usage is unchanged and still counted once by
+ * getRunUsageTotals, which COALESCEs the absent columns.
+ *
+ * WITH one, `inputTokens` narrows to UNCACHED input and the other three classes
+ * get their own columns. The four then sum to the same total the budget folds.
+ */
+function harnessJournalUsage(
+  reported: KnownUsage,
+  effectiveModel: string | undefined,
+): JournalSpanInput['usage'] {
+  const { breakdown } = reported;
+  if (breakdown === undefined) {
+    return {
+      model: reported.model ?? effectiveModel ?? '',
+      inputTokens: reported.tokens,
+      outputTokens: 0,
+      costUsd: reported.cost,
+    };
+  }
+  return {
+    // The provider's own label for what it billed beats the station's requested
+    // model, which may be an alias.
+    model: reported.model ?? effectiveModel ?? '',
+    inputTokens: breakdown.inputTokens,
+    outputTokens: breakdown.outputTokens,
+    costUsd: reported.cost,
+    cacheReadInputTokens: breakdown.cacheReadInputTokens,
+    cacheCreationInputTokens: breakdown.cacheCreationInputTokens,
+  };
+}
+
+/**
+ * Flatten a capacity snapshot into journal attributes (issue #5).
+ *
+ * Recorded per call so "what did this run draw against the plan" is a query
+ * rather than an inference from interactive usage bars.
+ */
+function rateLimitAttributes(snapshot: RateLimitSnapshot | undefined): Record<string, unknown> {
+  if (snapshot === undefined) return {};
+  const attrs: Record<string, unknown> = {};
+  if (snapshot.status !== undefined) attrs['rate_limit_status'] = snapshot.status;
+  if (snapshot.usingOverage !== undefined) attrs['rate_limit_using_overage'] = snapshot.usingOverage;
+  for (const w of snapshot.windows) {
+    attrs[`rate_limit_${w.name}_utilization`] = w.utilization;
+    attrs[`rate_limit_${w.name}_resets_at`] = w.resetsAtMs;
+  }
+  return attrs;
+}
+
+/** True when some ready card is still gated behind a future release_at. */
+function hasReleaseGatedCards(stateDb: Database, runId: string, nowSeconds: number): boolean {
+  const row = stateDb
+    .prepare(
+      `SELECT 1 AS gated FROM cards
+       WHERE run_id = $runId AND status = 'ready'
+         -- >= not >: on the tick the gate OPENS, the card is dispatchable
+         -- later in this same tick (planTick uses a strict release_at > now),
+         -- but the liveness check runs first. With a strict >, a park longer than
+         -- no_progress_minutes trips the watchdog on exactly the tick the card
+         -- was about to run — killing the run one step before it recovered.
+         AND release_at IS NOT NULL AND release_at >= $now
+       LIMIT 1`,
+    )
+    // bun:sqlite's .get() yields null (not undefined) for no rows — a `!==
+    // undefined` test here reports EVERY run as gated and silently disables the
+    // liveness watchdog.
+    .get({ $runId: runId, $now: nowSeconds }) as { gated: number } | null | undefined;
+  return row != null;
+}
 
 /** Composite key for workerHandles entries — NUL separator prevents cardId injection. */
 function slotKey(cardId: string, station: string): string {
@@ -594,6 +726,10 @@ export async function runExecutor(args: RunEngineArgs): Promise<void> {
         // sampled, even though the run was busy the whole time.
         lastAdapterActivityAt,
         activeWorkerCount: activeCount,
+        // A card parked behind a future release_at (issue #3's rate-limit park,
+        // or the v10 fan-out stagger) is scheduled, not stalled — the loop is
+        // already sleeping toward that gate a few lines below.
+        hasReleaseGatedCard: hasReleaseGatedCards(stateDb, runId, currentNow),
         hasScrappedDep: false,
         hasHoldAwaitingHuman,
         hasReadyButNoIdleWorker,
@@ -1018,6 +1154,7 @@ export async function runExecutor(args: RunEngineArgs): Promise<void> {
           harnessRegistry: args.harnessRegistry,
           foldHarnessUsage,
           stampHarnessActivity,
+          sleep,
           runSubflow: args.runSubflow,
         });
 
@@ -1080,6 +1217,7 @@ export async function runExecutor(args: RunEngineArgs): Promise<void> {
               harnessRegistry: args.harnessRegistry,
               foldHarnessUsage,
               stampHarnessActivity,
+              sleep,
               runSubflow: args.runSubflow,
             }),
           );
@@ -1326,6 +1464,8 @@ interface ExecuteStationArgs {
    * stamp for the harness path, which has no ModelAdapter call to hook.
    */
   stampHarnessActivity: () => void;
+  /** Injectable delay (issue #3 retry backoff); shared with the run loop's wait. */
+  sleep: (ms: number) => Promise<void>;
   /**
    * Seam that runs a `kind: subflow` station's child flow to terminal state
    * (the original multi-flow engine work) — threaded from RunEngineArgs. Absent → subflow stations
@@ -1366,6 +1506,7 @@ async function executeStation(args: ExecuteStationArgs): Promise<boolean> {
     harnessRegistry,
     foldHarnessUsage,
     stampHarnessActivity,
+    sleep,
     runSubflow,
   } = args;
 
@@ -1481,6 +1622,7 @@ async function executeStation(args: ExecuteStationArgs): Promise<boolean> {
       harnessRegistry,
       foldHarnessUsage,
       stampHarnessActivity,
+      sleep,
       err,
     });
   }
@@ -3241,6 +3383,12 @@ interface HarnessArgs {
   foldHarnessUsage: (tokens: number) => void;
   /** Stamps fresh liveness progress the instant a harness invoke() resolves (WI-567 FR-8 fix). */
   stampHarnessActivity: () => void;
+  /**
+   * Injectable delay, shared with the run loop's release-gate wait. Used for
+   * retry backoff (issue #3); tests inject a no-op so the suite does not pay
+   * real wall-clock seconds for a deliberate failure path.
+   */
+  sleep: (ms: number) => Promise<void>;
   err: (msg: string) => void;
 }
 
@@ -3281,7 +3429,7 @@ async function executeHarnessStation(args: HarnessArgs): Promise<boolean> {
   const {
     db, stateDb, runId, stationConfig, stationId, cardId, trackingAdapter, happyPathNext, terminalLanes,
     maxExecutionAttempts, projectRoot, flow, currentNow, runStartedAt, wallClockSeconds, maxTokens,
-    getTokensSpent, onAndonTrip, harnessRegistry, foldHarnessUsage, stampHarnessActivity, err,
+    getTokensSpent, onAndonTrip, harnessRegistry, foldHarnessUsage, stampHarnessActivity, sleep, err,
   } = args;
 
   const card = db.getCard(runId, cardId);
@@ -3504,6 +3652,43 @@ async function executeHarnessStation(args: HarnessArgs): Promise<boolean> {
         // attempt (timeout/nonzero-exit/untagged) — the invoke() call still
         // consumed real wall-clock time and must count as progress.
         stampHarnessActivity();
+
+        // ── Provider rate limit: PARK, do not spend an attempt (issue #3) ────
+        // A cap is not a failed attempt. Retrying it cannot work until the
+        // window resets, and because the retry loop had no delay, three
+        // attempts were consumed in ~3 seconds — scrapping the card and
+        // discarding paid work from earlier attempts along with it.
+        //
+        // So: leave `callsMade` alone, stamp cards.release_at with the reset the
+        // provider itself reported, and hand the card back to 'ready' at the
+        // same lane. The existing release gate (planTick) keeps it
+        // undispatchable until then, and the run loop already sleeps to the
+        // soonest gate with the consumption andon checked FIRST — so a cap
+        // longer than the run's wall-clock budget halts rather than idling.
+        if ((invokeErr as { code?: string }).code === 'harness-rate-limited') {
+          const resetAtMs = (invokeErr as { resetAtMs?: number }).resetAtMs;
+          const releaseAt = releaseAtForRateLimit(currentNow, resetAtMs, Date.now());
+          db.appendJournalSpan({
+            runId, cardId, station: stationId, attempt: attemptIndex, name: `${stationId}.harness`,
+            adapter: harnessAdapter.name, durationMs: Date.now() - invokeStartedAt, usageUnknown: true,
+            attributes: {
+              // Issue #5 ask (4): a usage_unknown row that names WHY. This is
+              // what separates "capped, cost nothing" from "ran for minutes and
+              // its spend is unrecorded" without inferring it from duration.
+              outcome: 'harness-rate-limited',
+              rate_limit_release_at: releaseAt,
+              rate_limit_reset_reported: resetAtMs ?? null,
+              ...rateLimitAttributes((invokeErr as { rateLimit?: RateLimitSnapshot }).rateLimit),
+            },
+          });
+          parkCardUntil(
+            stateDb, db, cardId, stationId, card, releaseAt, runId,
+            buildTransitionContext(stationId, flow, happyPathNext, terminalLanes, maxExecutionAttempts),
+            (invokeErr as Error).message, err,
+          );
+          return false;
+        }
+
         callsMade++;
         // Adapter-throw classification follows the transform/openai-adapter
         // precedent (transform.ts branches on err.code === 'vision-unsupported').
@@ -3524,6 +3709,14 @@ async function executeHarnessStation(args: HarnessArgs): Promise<boolean> {
           adapter: harnessAdapter.name, durationMs: Date.now() - invokeStartedAt, usageUnknown: true,
           attributes: { outcome: scrapReason },
         });
+        // Issue #3: back off before the next attempt. Without this,
+        // max_execution_attempts doubled as the wall-clock retry policy and any
+        // persistent-but-temporary fault burned the whole budget in seconds.
+        // Skipped once the cap is spent — nothing follows, so waiting only
+        // delays the scrap.
+        if (callsMade < maxExecutionAttempts) {
+          await sleep(harnessRetryDelayMs(callsMade));
+        }
         continue;
       }
 
@@ -3543,15 +3736,19 @@ async function executeHarnessStation(args: HarnessArgs): Promise<boolean> {
       let usageKnown = false;
       let reportedTokens = 0;
       let reportedCost = 0;
+      let journalUsage: JournalSpanInput['usage'];
+      let rateLimitAttrs: Record<string, unknown> = {};
       if (!('unknown' in invokeResult.usage)) {
+        const reported = invokeResult.usage;
         usageKnown = true;
-        reportedTokens = invokeResult.usage.tokens;
-        reportedCost = invokeResult.usage.cost;
+        reportedTokens = reported.tokens;
+        reportedCost = reported.cost;
+        // Budgets fold the TOTAL, unchanged by issue #5's column split — the
+        // breakdown below is a reporting concern, not an accounting one.
         foldHarnessUsage(reportedTokens);
+        journalUsage = harnessJournalUsage(reported, effectiveModel);
+        rateLimitAttrs = rateLimitAttributes(reported.rateLimit);
       }
-      const journalUsage = usageKnown
-        ? { model: effectiveModel ?? '', inputTokens: reportedTokens, outputTokens: 0, costUsd: reportedCost }
-        : undefined;
 
       // ── WI-568 / Findings 6+7: MANDATORY owned-paths integrity gate ──────────
       // Runs on EVERY resolved attempt, the instant invoke() settles and BEFORE
@@ -3681,7 +3878,10 @@ async function executeHarnessStation(args: HarnessArgs): Promise<boolean> {
       db.appendJournalSpan({
         runId, cardId, station: stationId, attempt: attemptIndex, name: `${stationId}.harness`,
         adapter: harnessAdapter.name, durationMs, usageUnknown: !usageKnown, usage: journalUsage,
-        attributes: { artifact_hashes: artifactHashes, outcome: 'success' },
+        // Issue #5: the capacity snapshot rides along on the priced row, so
+        // "what did this run draw against the plan" is a query rather than an
+        // inference from interactive usage bars.
+        attributes: { artifact_hashes: artifactHashes, outcome: 'success', ...rateLimitAttrs },
       });
 
       // ── Write checkpoint (binding stamp) ───────────────────────────────────
@@ -3924,6 +4124,10 @@ async function executeSubflowStation(args: SubflowArgs): Promise<boolean> {
       // child still spent real tokens.
       const usageKnown = result.tokens !== undefined;
       if (result.tokens !== undefined) foldHarnessUsage(result.tokens);
+      // A subflow reports one rolled-up scalar, with no per-class split to
+      // pass on: keep the pre-#5 shape (total in inputTokens, cache columns
+      // left NULL) rather than fabricating a breakdown. getRunUsageTotals
+      // COALESCEs the missing columns, so this still counts exactly once.
       const journalUsage = usageKnown
         ? { model: '', inputTokens: result.tokens ?? 0, outputTokens: 0, costUsd: result.costUsd ?? 0 }
         : undefined;
@@ -4179,6 +4383,82 @@ function escalateToHold(
   // Surface the escalation on stderr — parity with the plan.escalations path
   // which calls io.err directly in the main loop (SPEC: escalate AND surface to a human).
   err(`escalation: card ${cardId} held — ${detail}`);
+}
+
+/**
+ * Park a rate-limited card until `releaseAtSeconds`, spending no attempt (issue #3).
+ *
+ * `releaseAtSeconds` is in the INJECTED clock's frame — see releaseAtForRateLimit.
+ *
+ * Routed through `transition()` like every other post-work move — the FSM stays
+ * the sole authority for what (lane, status) is legal, and an illegal move
+ * escalates rather than being forced through with a raw UPDATE.
+ *
+ * Releases the active_workers slot in the SAME transaction that re-readies the
+ * card, for the reason escalateToHold documents: a parked card is not working,
+ * and leaving the row behind would block siblings at a wip:1 station forever
+ * (reconcile only reclaims status='working' cards) while suppressing the
+ * liveness watchdog.
+ */
+function parkCardUntil(
+  stateDb: Database,
+  db: ConduitDB,
+  cardId: string,
+  stationId: string,
+  card: { lane: string; attempt: number; rework_count?: number },
+  releaseAtSeconds: number,
+  runId: string,
+  ctx: TransitionContext,
+  detail: string,
+  err: (msg: string) => void,
+): void {
+  const fsmResult = transition(
+    {
+      lane: card.lane,
+      status: 'working',
+      executionAttempt: card.attempt,
+      reworkCount: card.rework_count ?? 0,
+    },
+    { type: 'RATE_LIMITED' },
+    ctx,
+  );
+  if (!fsmResult.ok) {
+    escalateToHold(stateDb, db, cardId, stationId, card,
+      `FSM illegal_transition on RATE_LIMITED for harness station '${stationId}'`, err, runId);
+    return;
+  }
+
+  db.appendCardLog({
+    runId,
+    kind: 'entered_lane',
+    cardId,
+    station: stationId,
+    attempt: card.attempt,
+    sourceLane: card.lane,
+    destLane: fsmResult.next.lane,
+    // NOT 'rework' — countGateReworks counts rework-classed entries against a
+    // gate's cap, and a provider cap must never consume one.
+    reasonClass: 'rate_limited',
+  });
+
+  stateDb
+    .transaction(() => {
+      stateDb
+        .prepare(
+          `UPDATE cards SET status = $status, release_at = $releaseAt
+           WHERE run_id = $runId AND id = $id`,
+        )
+        .run({ $status: fsmResult.next.status, $releaseAt: releaseAtSeconds, $runId: runId, $id: cardId });
+      stateDb
+        .prepare('DELETE FROM active_workers WHERE run_id = $runId AND card_id = $id AND station = $station')
+        .run({ $runId: runId, $id: cardId, $station: stationId });
+    })
+    .immediate();
+
+  err(
+    `rate limited: card ${cardId} parked at '${stationId}' until release_at=` +
+      `${releaseAtSeconds} (no attempt consumed) — ${detail}`,
+  );
 }
 
 // ---------------------------------------------------------------------------

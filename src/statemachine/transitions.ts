@@ -58,6 +58,7 @@ export type KernelEvent =
   | { type: 'FAN_OUT' }
   | { type: 'FAN_IN_MET' }
   | { type: 'WORKER_CRASH' }
+  | { type: 'RATE_LIMITED' }
   | { type: 'REHYDRATE' };
 
 /**
@@ -241,6 +242,25 @@ export function transition(
     case 'WORKER_CRASH':
       if (state.status !== 'working') return ILLEGAL;
       return advance(state, { status: 'interrupted' });
+
+    // ── Provider rate limit (issue #3) ───────────────────────────────────────
+
+    case 'RATE_LIMITED':
+      // A provider cap is NOT a failed attempt: the work never ran, nothing was
+      // billed, and retrying before the cap resets cannot succeed. So the card
+      // goes straight back to 'ready' at the SAME lane with NO counter touched —
+      // neither the rework count nor the execution attempt. Spending an attempt
+      // here is what let a session cap burn a card's whole budget in three
+      // seconds and scrap work that had already been paid for.
+      //
+      // WHEN it may run again is not this FSM's business: the caller stamps
+      // cards.release_at, and the existing release gate (planTick) keeps the
+      // card undispatchable until then. This mirrors WORKER_CRASH + REHYDRATE
+      // in effect, but is deliberately its own event — a rate limit is an
+      // expected operating condition, not a crash, and conflating them would
+      // make the two indistinguishable in the card log.
+      if (state.status !== 'working') return ILLEGAL;
+      return advance(state, { status: 'ready' });
 
     // ── Reconcile / re-hydrate (SPEC §15 step 1) ─────────────────────────────
 

@@ -346,7 +346,14 @@ describe('codex-exec adapter: structured usage parsing (real schema)', () => {
     // = 1660. reasoning_output_tokens is a BILLED output counter, so it IS
     // summed; cached_input_tokens is not. Real codex usage carries no cost, so
     // cost is a documented best-effort 0 — never fabricated, never dropped.
-    expect(result.usage).toEqual({ tokens: 1660, cost: 0 });
+    expect(result.usage).toEqual({
+      tokens: 1660,
+      cost: 0,
+      breakdown: {
+        inputTokens: 944, outputTokens: 460,
+        cacheReadInputTokens: 256, cacheCreationInputTokens: 0,
+      },
+    });
   });
 
   it('REGRESSION (Lynch/Amy re-review): a usage event WITHOUT a cost field → tokens extracted, cost 0, NOT unknown', async () => {
@@ -363,7 +370,14 @@ describe('codex-exec adapter: structured usage parsing (real schema)', () => {
 
     expect(result.usage).not.toEqual({ unknown: true });
     // 800 input + 200 output + 50 reasoning = 1050.
-    expect(result.usage).toEqual({ tokens: 1050, cost: 0 });
+    expect(result.usage).toEqual({
+      tokens: 1050,
+      cost: 0,
+      breakdown: {
+        inputTokens: 736, outputTokens: 250,
+        cacheReadInputTokens: 64, cacheCreationInputTokens: 0,
+      },
+    });
   });
 
   it('SUMS per-turn usage across every turn.completed event (multi-turn is not cumulative)', async () => {
@@ -379,7 +393,14 @@ describe('codex-exec adapter: structured usage parsing (real schema)', () => {
     const result = await makeAdapter({ run: makeRun({ stdout }).run }).invoke(invocation());
 
     // input (100+300) + output (40+60) + reasoning (20+15) = 400 + 100 + 35 = 535.
-    expect(result.usage).toEqual({ tokens: 535, cost: 0 });
+    expect(result.usage).toEqual({
+      tokens: 535,
+      cost: 0,
+      breakdown: {
+        inputTokens: 360, outputTokens: 135,
+        cacheReadInputTokens: 40, cacheCreationInputTokens: 0,
+      },
+    });
   });
 
   it('folds reasoning_output_tokens into the output total (a billed output counter)', async () => {
@@ -389,9 +410,23 @@ describe('codex-exec adapter: structured usage parsing (real schema)', () => {
     const a = await makeAdapter({ run: makeRun({ stdout: withReasoning }).run }).invoke(invocation());
     const b = await makeAdapter({ run: makeRun({ stdout: withoutReasoning }).run }).invoke(invocation());
 
-    expect(a.usage).toEqual({ tokens: 165, cost: 0 });
+    expect(a.usage).toEqual({
+      tokens: 165,
+      cost: 0,
+      breakdown: {
+        inputTokens: 100, outputTokens: 65,
+        cacheReadInputTokens: 0, cacheCreationInputTokens: 0,
+      },
+    });
     // Missing reasoning_output_tokens contributes 0 — never NaN, never dropped tokens.
-    expect(b.usage).toEqual({ tokens: 140, cost: 0 });
+    expect(b.usage).toEqual({
+      tokens: 140,
+      cost: 0,
+      breakdown: {
+        inputTokens: 100, outputTokens: 40,
+        cacheReadInputTokens: 0, cacheCreationInputTokens: 0,
+      },
+    });
   });
 
   it('ignores non-usage stream events and reads usage from turn.completed only', async () => {
@@ -402,7 +437,14 @@ describe('codex-exec adapter: structured usage parsing (real schema)', () => {
       JSON.stringify({ type: 'turn.completed', usage: { input_tokens: 10, cached_input_tokens: 0, output_tokens: 5, reasoning_output_tokens: 0 } }),
     ].join('\n');
     const result = await makeAdapter({ run: makeRun({ stdout }).run }).invoke(invocation());
-    expect(result.usage).toEqual({ tokens: 15, cost: 0 });
+    expect(result.usage).toEqual({
+      tokens: 15,
+      cost: 0,
+      breakdown: {
+        inputTokens: 10, outputTokens: 5,
+        cacheReadInputTokens: 0, cacheCreationInputTokens: 0,
+      },
+    });
   });
 
   it('reports usage explicitly UNKNOWN (never zero) when a success stream carries no usage event', async () => {
@@ -420,7 +462,14 @@ describe('codex-exec adapter: structured usage parsing (real schema)', () => {
     // build. Today's codex never emits this field.
     const stdout = JSON.stringify({ type: 'turn.completed', usage: { input_tokens: 10, output_tokens: 5, total_cost_usd: 0.0002 } });
     const result = await makeAdapter({ run: makeRun({ stdout }).run }).invoke(invocation());
-    expect(result.usage).toEqual({ tokens: 15, cost: 0.0002 });
+    expect(result.usage).toEqual({
+      tokens: 15,
+      cost: 0.0002,
+      breakdown: {
+        inputTokens: 10, outputTokens: 5,
+        cacheReadInputTokens: 0, cacheCreationInputTokens: 0,
+      },
+    });
   });
 
   it('returns no fabricated output references (declared outputs are collected from disk)', async () => {

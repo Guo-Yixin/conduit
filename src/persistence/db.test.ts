@@ -398,6 +398,74 @@ describe('journal secret hygiene (AC7, SPEC §11 L2)', () => {
 // Finding #9 — getStationUsage SUMs every usage span for the triple.
 // ---------------------------------------------------------------------------
 
+describe('issue #5 — the cache split must not move the budget', () => {
+  it('counts ALL FOUR token classes in the run total', () => {
+    // THE REGRESSION THIS GUARDS: before the split, the harness path summed
+    // every class into input_tokens, so `input + output` WAS the true total.
+    // Now input_tokens is uncached input only — summing just those two would
+    // silently drop cache reads, which are the majority of real traffic, and
+    // the run budget would stop tripping.
+    db!.appendJournalSpan({
+      runId: DEFAULT_RUN_ID,
+      cardId: 'card_split',
+      station: 'draft',
+      attempt: 0,
+      name: 'draft.harness',
+      usage: {
+        model: 'claude-opus-5',
+        inputTokens: 1000,
+        outputTokens: 500,
+        costUsd: 0.05,
+        cacheReadInputTokens: 200,
+        cacheCreationInputTokens: 300,
+      },
+    });
+
+    expect(db!.getRunUsageTotals(DEFAULT_RUN_ID).tokens).toBe(2000);
+  });
+
+  it('counts a PRE-split row exactly once', () => {
+    // A row written before the migration carries the summed total in
+    // input_tokens with both cache columns NULL. COALESCE must leave it at its
+    // original total rather than dropping it or double-counting it.
+    db!.appendJournalSpan({
+      runId: DEFAULT_RUN_ID,
+      cardId: 'card_legacy',
+      station: 'draft',
+      attempt: 0,
+      name: 'draft.harness',
+      usage: { model: 'legacy', inputTokens: 2000, outputTokens: 0, costUsd: 0.05 },
+    });
+
+    expect(db!.getRunUsageTotals(DEFAULT_RUN_ID).tokens).toBe(2000);
+  });
+
+  it('round-trips the cache columns so the cache fraction is measurable', () => {
+    // The question issue #5 could not answer: "what fraction of spend is cache
+    // reads?" It is now a division, not an inference.
+    db!.appendJournalSpan({
+      runId: DEFAULT_RUN_ID,
+      cardId: 'card_frac',
+      station: 'draft',
+      attempt: 0,
+      name: 'draft.harness',
+      usage: {
+        model: 'claude-opus-5',
+        inputTokens: 100,
+        outputTokens: 100,
+        costUsd: 0.01,
+        cacheReadInputTokens: 800,
+        cacheCreationInputTokens: 0,
+      },
+    });
+
+    const usage = db!.getStationUsage('card_frac', 'draft', 0)!;
+    expect(usage['gen_ai.usage.cache_read_input_tokens']).toBe(800);
+    // output_tokens is genuinely populated now — it was 0 on every row before.
+    expect(usage['gen_ai.usage.output_tokens']).toBe(100);
+  });
+});
+
 describe('getStationUsage aggregation (finding #9)', () => {
   it('sums input/output tokens and cost across MULTIPLE spans for one (card,station,attempt)', () => {
     // Two billed calls within the same execution attempt (e.g. a tool-loop turn).
@@ -439,6 +507,11 @@ describe('getStationUsage aggregation (finding #9)', () => {
     expect(db!.getStationUsage('card_one', 'brief', 0)).toEqual({
       'gen_ai.usage.input_tokens': 42,
       'gen_ai.usage.output_tokens': 7,
+      // A span written WITHOUT the issue-#5 cache split reads back 0, not null:
+      // the columns are absent for this row, and 0 is the honest aggregate for
+      // "no cache tokens were reported".
+      'gen_ai.usage.cache_read_input_tokens': 0,
+      'gen_ai.usage.cache_creation_input_tokens': 0,
       'gen_ai.request.model': 'claude-y',
       cost_usd: 0.0123,
     });
@@ -1947,6 +2020,91 @@ describe('v9→v10 migration — cards.release_at (fan-out stagger)', () => {
       expect(user_version).toBe(SCHEMA_VERSION); // stamped to 10
     } finally {
       check.close();
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Issue #5 — migrating a journal that already holds real traffic.
+// ---------------------------------------------------------------------------
+
+describe('issue #5 — the cache columns migrate onto an EXISTING journal', () => {
+  /**
+   * The journal this issue was filed against is a live production instance with
+   * a month of rows. An additive migration that only worked on a fresh file
+   * would be no fix at all, so build the PRE-#5 table by hand and open over it.
+   */
+  function seedPreSplitJournal(journalPath: string): void {
+    const raw = new Database(journalPath);
+    raw.exec(`
+      CREATE TABLE journal (
+        id               INTEGER PRIMARY KEY AUTOINCREMENT,
+        run_id           TEXT NOT NULL DEFAULT 'default',
+        card_id          TEXT NOT NULL,
+        station          TEXT NOT NULL,
+        attempt          INTEGER NOT NULL,
+        name             TEXT NOT NULL,
+        attributes_json  TEXT NOT NULL DEFAULT '{}',
+        model            TEXT,
+        input_tokens     INTEGER,
+        output_tokens    INTEGER,
+        cost_usd         REAL,
+        adapter          TEXT,
+        duration_ms      INTEGER,
+        usage_unknown    INTEGER NOT NULL DEFAULT 0,
+        created_at       INTEGER NOT NULL DEFAULT (unixepoch())
+      );
+    `);
+    // One row in the shape the issue reports: the whole total in input_tokens,
+    // output_tokens 0 on a priced call.
+    raw
+      .prepare(
+        `INSERT INTO journal (run_id, card_id, station, attempt, name,
+           model, input_tokens, output_tokens, cost_usd, adapter, usage_unknown)
+         VALUES ('default','old','narrate',0,'narrate.harness',
+           'claude-opus-4-8', 2000, 0, 5.2, 'claude-headless', 0)`,
+      )
+      .run();
+    raw.close();
+  }
+
+  it('adds the columns without disturbing the rows already there', () => {
+    const journalPath = join(dir, 'existing-journal.sqlite');
+    seedPreSplitJournal(journalPath);
+
+    const migrated = openConduitDB({ stateDbPath: join(dir, 's.sqlite'), journalDbPath: journalPath });
+    try {
+      const usage = migrated.getStationUsage('old', 'narrate', 0)!;
+      // The pre-existing row survives, with its original numbers intact.
+      expect(usage['gen_ai.usage.input_tokens']).toBe(2000);
+      expect(usage['cost_usd']).toBeCloseTo(5.2);
+      // Its cache columns are absent, aggregating to 0 — not an error, and not
+      // a fabricated split of a number nobody split at the time.
+      expect(usage['gen_ai.usage.cache_read_input_tokens']).toBe(0);
+    } finally {
+      migrated.close();
+    }
+  });
+
+  it('counts a pre-split row ONCE in the run total, alongside a post-split one', () => {
+    const journalPath = join(dir, 'mixed-journal.sqlite');
+    seedPreSplitJournal(journalPath);
+
+    const migrated = openConduitDB({ stateDbPath: join(dir, 's2.sqlite'), journalDbPath: journalPath });
+    try {
+      migrated.appendJournalSpan({
+        runId: 'default', cardId: 'new', station: 'narrate', attempt: 0, name: 'narrate.harness',
+        usage: {
+          model: 'claude-opus-5', inputTokens: 100, outputTokens: 100, costUsd: 0.1,
+          cacheReadInputTokens: 800, cacheCreationInputTokens: 0,
+        },
+      });
+
+      // 2000 (legacy, whole total in input_tokens) + 1000 (split across four
+      // columns). A run spanning the migration boundary still budgets correctly.
+      expect(migrated.getRunUsageTotals('default').tokens).toBe(3000);
+    } finally {
+      migrated.close();
     }
   });
 });

@@ -359,6 +359,11 @@ describe('WI-567 AC5 — new journal columns are additive (existing rows survive
     expect(db.getStationUsage('legacy', 'brief', 0)).toEqual({
       'gen_ai.usage.input_tokens': 42,
       'gen_ai.usage.output_tokens': 7,
+      // Issue #5's cache columns are ABSENT on this pre-#5 row, and the
+      // aggregate reports 0 rather than null — the row is still readable
+      // and its original numbers are unmasked, which is what AC5 asserts.
+      'gen_ai.usage.cache_read_input_tokens': 0,
+      'gen_ai.usage.cache_creation_input_tokens': 0,
       'gen_ai.request.model': 'gpt-4o-mini',
       cost_usd: 0.0123,
     });

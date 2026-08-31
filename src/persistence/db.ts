@@ -275,6 +275,18 @@ CREATE TABLE IF NOT EXISTS journal (
   adapter          TEXT,
   duration_ms      INTEGER,
   usage_unknown    INTEGER NOT NULL DEFAULT 0,
+  -- Issue #5: the cache split, as its OWN columns rather than folded into
+  -- input_tokens. Before this, the harness path summed all four token classes
+  -- into input_tokens and wrote output_tokens = 0, so "how much of our spend is
+  -- cache reads" was not derivable and output cost could not be compared across
+  -- providers with different output:input ratios.
+  --
+  -- input_tokens is now UNCACHED input only. Anything summing "total tokens"
+  -- must add all four columns — see getRunUsageTotals, which is the budget's
+  -- source of truth and would otherwise silently under-count by the cache-read
+  -- fraction (~55-70% of real traffic).
+  cache_read_input_tokens      INTEGER,
+  cache_creation_input_tokens  INTEGER,
   created_at       INTEGER NOT NULL DEFAULT (unixepoch())
 );
 
@@ -364,8 +376,16 @@ const CARD_LOG_FINDING_MAX_LENGTH = 4096;
 // card_log public types
 // ---------------------------------------------------------------------------
 
-/** The four reason classes that describe why a card moved to a new lane. */
-export type ReasonClass = 'forward' | 'rework' | 'scrap' | 'hold';
+/**
+ * The reason classes that describe why a card moved to a new lane.
+ *
+ * 'rate_limited' is deliberately its OWN class rather than folded into 'rework'
+ * or 'hold' (issue #3): countGateReworks counts 'rework' entries against a
+ * gate's cap, so a provider cap classed that way would consume budget it never
+ * used, and 'hold' would imply a human has to release it when the release gate
+ * is automatic.
+ */
+export type ReasonClass = 'forward' | 'rework' | 'scrap' | 'hold' | 'rate_limited';
 
 /** The two possible gate verdicts from a QC station. */
 export type GateVerdict = 'pass' | 'reject';
@@ -440,9 +460,18 @@ export interface JournalSpanInput {
   /** Per-call token/cost for OTel-GenAI backend export. */
   usage?: {
     model: string;
+    /**
+     * UNCACHED input only (issue #5). Adapters that report a cache split put
+     * cache reads/creations in their own fields below; anything computing a
+     * TOTAL must add all four, never just input+output.
+     */
     inputTokens: number;
     outputTokens: number;
     costUsd: number;
+    /** Cache-read input, when the adapter reports it separately. */
+    cacheReadInputTokens?: number;
+    /** Cache-creation input, when the adapter reports it separately. */
+    cacheCreationInputTokens?: number;
   };
   /** Harness/adapter identity (WI-567) — e.g. 'claude-headless', 'codex-exec'. */
   adapter?: string;
@@ -1037,11 +1066,13 @@ class ConduitDBImpl implements ConduitDB {
         `INSERT INTO journal
            (run_id, card_id, station, attempt, name, attributes_json,
             model, input_tokens, output_tokens, cost_usd,
-            adapter, duration_ms, usage_unknown)
+            adapter, duration_ms, usage_unknown,
+            cache_read_input_tokens, cache_creation_input_tokens)
          VALUES
            ($run_id, $card_id, $station, $attempt, $name, $attributes_json,
             $model, $input_tokens, $output_tokens, $cost_usd,
-            $adapter, $duration_ms, $usage_unknown)`,
+            $adapter, $duration_ms, $usage_unknown,
+            $cache_read_input_tokens, $cache_creation_input_tokens)`,
       )
       .run({
         $run_id: span.runId,
@@ -1057,6 +1088,8 @@ class ConduitDBImpl implements ConduitDB {
         $adapter: span.adapter ?? null,
         $duration_ms: span.durationMs ?? null,
         $usage_unknown: span.usageUnknown === true ? 1 : 0,
+        $cache_read_input_tokens: span.usage?.cacheReadInputTokens ?? null,
+        $cache_creation_input_tokens: span.usage?.cacheCreationInputTokens ?? null,
       });
   }
 
@@ -1080,6 +1113,8 @@ class ConduitDBImpl implements ConduitDB {
            MAX(model)           AS model,
            SUM(input_tokens)    AS input_tokens,
            SUM(output_tokens)   AS output_tokens,
+           SUM(cache_read_input_tokens)     AS cache_read_input_tokens,
+           SUM(cache_creation_input_tokens) AS cache_creation_input_tokens,
            SUM(cost_usd)        AS cost_usd
          FROM journal
          WHERE card_id = $card_id
@@ -1092,6 +1127,8 @@ class ConduitDBImpl implements ConduitDB {
         model: string | null;
         input_tokens: number | null;
         output_tokens: number | null;
+        cache_read_input_tokens: number | null;
+        cache_creation_input_tokens: number | null;
         cost_usd: number | null;
       } | undefined;
 
@@ -1101,6 +1138,11 @@ class ConduitDBImpl implements ConduitDB {
     return {
       'gen_ai.usage.input_tokens': row.input_tokens ?? 0,
       'gen_ai.usage.output_tokens': row.output_tokens ?? 0,
+      // Not OTel-GenAI standard names, but the cache split is the whole point
+      // of issue #5: without it "what fraction of spend is cache reads" is not
+      // answerable, and neither is a cross-provider output-cost comparison.
+      'gen_ai.usage.cache_read_input_tokens': row.cache_read_input_tokens ?? 0,
+      'gen_ai.usage.cache_creation_input_tokens': row.cache_creation_input_tokens ?? 0,
       'gen_ai.request.model': row.model,
       cost_usd: row.cost_usd ?? 0,
     };
@@ -1145,8 +1187,17 @@ class ConduitDBImpl implements ConduitDB {
   getRunUsageTotals(runId: string): { tokens: number; costUsd: number } {
     const row = this.journalDb
       .prepare(
+        // ALL FOUR token columns. input_tokens is uncached input only (issue
+        // #5), so summing just input+output would drop cache reads — the
+        // majority of real traffic — and the run budget would stop tripping.
+        // Pre-#5 rows carry the old summed total in input_tokens with the two
+        // cache columns NULL, so COALESCE keeps them counted exactly once.
         `SELECT
-           COALESCE(SUM(COALESCE(input_tokens, 0) + COALESCE(output_tokens, 0)), 0) AS tokens,
+           COALESCE(SUM(
+             COALESCE(input_tokens, 0) + COALESCE(output_tokens, 0)
+             + COALESCE(cache_read_input_tokens, 0)
+             + COALESCE(cache_creation_input_tokens, 0)
+           ), 0) AS tokens,
            COALESCE(SUM(COALESCE(cost_usd, 0)), 0) AS cost_usd
          FROM journal
          WHERE run_id = $run_id`,
@@ -2163,6 +2214,23 @@ export function openConduitDB({
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
     if (!msg.includes('duplicate column name') && !msg.includes('no such table')) throw err;
+  }
+
+  // (a''') journal — issue #5 ADDITIVE ALTERs: the cache split. Nullable with no
+  // backfill, so a pre-existing row (whose input_tokens is a SUMMED total) reads
+  // back null here rather than being silently reinterpreted as uncached input.
+  // A query spanning the migration boundary can tell the two eras apart by
+  // exactly that null.
+  for (const column of [
+    'ALTER TABLE journal ADD COLUMN cache_read_input_tokens INTEGER',
+    'ALTER TABLE journal ADD COLUMN cache_creation_input_tokens INTEGER',
+  ]) {
+    try {
+      journalDb.exec(column);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      if (!msg.includes('duplicate column name') && !msg.includes('no such table')) throw err;
+    }
   }
 
   // (b) card_log — TABLE-RECREATE: the UNIQUE changed from

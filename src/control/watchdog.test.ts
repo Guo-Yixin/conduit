@@ -187,6 +187,36 @@ describe('liveness watchdog (AC4/AC5)', () => {
     expect(alert.detail ?? '').not.toBe('');
   });
 
+  it('does NOT trip while a card is gated behind a future release_at', () => {
+    // Scheduled waiting is not a deadlock. Without this, a rate-limit park
+    // (issue #3) or a fan-out stagger longer than no_progress_minutes reads as
+    // "no progress + no active worker" and halts a run that was about to
+    // resume on its own.
+    const alert = checkLiveness(
+      liveness({
+        lastLaneChangeAt: NOW,
+        now: NOW + 400,
+        activeWorkerCount: 0,
+        hasReleaseGatedCard: true,
+      }),
+      { noProgressSeconds: 300 },
+    );
+    expect(alert.tripped).toBe(false);
+  });
+
+  it('still trips on the SAME state once nothing is gated any more', () => {
+    // Pins that the suppression is the gate itself, not a blanket loosening of
+    // the stall check.
+    const base = {
+      lastLaneChangeAt: NOW,
+      now: NOW + 400,
+      activeWorkerCount: 0,
+      hasReadyButNoIdleWorker: true,
+    };
+    expect(checkLiveness(liveness({ ...base, hasReleaseGatedCard: true }), { noProgressSeconds: 300 }).tripped).toBe(false);
+    expect(checkLiveness(liveness({ ...base, hasReleaseGatedCard: false }), { noProgressSeconds: 300 }).tripped).toBe(true);
+  });
+
   it('reports hold_awaiting_human as the blocking reason', () => {
     const alert = checkLiveness(
       liveness({ lastLaneChangeAt: NOW, now: NOW + 400, hasHoldAwaitingHuman: true }),

@@ -47,6 +47,52 @@ export interface HarnessRunnerConfig {
    * for testability; defaults to `process.env`.
    */
   sourceEnv?: Record<string, string | undefined>;
+  /**
+   * Keep only the stdout lines this predicate accepts, discarding the rest AS
+   * THEY ARRIVE rather than buffering the whole stream.
+   *
+   * For a line-delimited protocol this is the difference between holding a few
+   * kilobytes and holding the entire agent transcript: a `stream-json` run that
+   * merely read two files measured 57KB of stream against a 2KB result event,
+   * and that ratio grows with every tool call across an 8-to-17-minute station.
+   *
+   * ONLY for newline-delimited output — a stream with no newlines accumulates
+   * in the carry buffer exactly as an unfiltered read would.
+   */
+  stdoutLineFilter?: (line: string) => boolean;
+}
+
+/**
+ * Drain a newline-delimited stream, retaining only the lines `keep` accepts.
+ *
+ * Decoding is incremental (`{ stream: true }`) so a multi-byte character split
+ * across two chunks is not mangled, and only the current partial line plus the
+ * kept lines are ever held.
+ */
+async function readKeptLines(
+  stream: ReadableStream<Uint8Array>,
+  keep: (line: string) => boolean,
+): Promise<string> {
+  const decoder = new TextDecoder();
+  const kept: string[] = [];
+  let carry = '';
+
+  for await (const chunk of stream) {
+    carry += decoder.decode(chunk, { stream: true });
+    let newline = carry.indexOf('\n');
+    while (newline !== -1) {
+      const line = carry.slice(0, newline);
+      carry = carry.slice(newline + 1);
+      if (keep(line)) kept.push(line);
+      newline = carry.indexOf('\n');
+    }
+  }
+  // Flush the decoder, then the final unterminated line (a stream need not end
+  // with a newline, and on a crash it very often does not).
+  carry += decoder.decode();
+  if (carry.length > 0 && keep(carry)) kept.push(carry);
+
+  return kept.join('\n');
 }
 
 export interface HarnessSpawnResult {
@@ -141,7 +187,9 @@ export async function runHarnessProcess(
 
   const [exitCode, stdout, stderr] = await Promise.all([
     proc.exited,
-    new Response(proc.stdout).text(),
+    config.stdoutLineFilter !== undefined
+      ? readKeptLines(proc.stdout as ReadableStream<Uint8Array>, config.stdoutLineFilter)
+      : new Response(proc.stdout).text(),
     new Response(proc.stderr as ReadableStream).text(),
   ]);
   clearTimeout(timer);
