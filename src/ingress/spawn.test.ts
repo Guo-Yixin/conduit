@@ -821,3 +821,66 @@ describe('ack on accept (the original acknowledgement-on-accept work)', () => {
     expect(slots.inFlightCount()).toBe(0);
   });
 });
+
+// ===========================================================================
+// Issue #7 — a PARKED run is not a failed run
+// ===========================================================================
+
+describe('exit watcher × parked run (issue #7)', () => {
+  const NOW_MS = 1_700_000_000_000;
+  const NOW_S = 1_700_000_000;
+
+  /** Leave the run exactly as cmdRun leaves a parked halt: the row, and a ready card behind its gate. */
+  function parkRun(runId: string, releaseAt: number): void {
+    db.insertRun({ run_id: runId, flow: '/flows/github-sync.yaml', input_fingerprint: 'fp', status: 'halted', outcome: 'parked' });
+    db.insertCard({ run_id: runId, id: 'c1', parent_id: null, lane: 'narrate', status: 'ready', attempt: 0, wave: 0, owned_paths: [], rework_count: 0 });
+    db.getStateDb().prepare('UPDATE cards SET release_at = $at WHERE run_id = $r').run({ $at: releaseAt, $r: runId });
+  }
+
+  it('leaves a parked run spawned, logs parked (run id + ISO gate), and alerts informationally — never spawn_failed', async () => {
+    const spawn = launchingSpawn();
+    const alert = recordingAlert();
+    const slots = createRunSlots({ capacity: 1 });
+    const runId = deriveIngressRunId('evt-1');
+
+    await runSpawnPath(
+      { db, spawn: spawn.seam, alert: alert.seam, globalAlertChannel: '#l', redriveCap: 3, slots, now: () => NOW_MS },
+      baseInput({ flow: makeFlow('#gh') }),
+    );
+    // The run parks and its process exits 1 — the documented "did not complete".
+    parkRun(runId, NOW_S + 600);
+    spawn.exit(1);
+    await settleExitWatcher();
+
+    // The incident: this row went 'failed', the alert said "exited with code 1",
+    // and the boot sweep re-drove a run that only needed resuming.
+    expect(db.getIngressEvent('evt-1')).toMatchObject({ spawn_state: 'spawned', spawn_attempts: 1 });
+    expect(db.getIngressLog().map((e) => e.outcome)).toEqual(['accepted', 'parked']);
+    const parked = db.getIngressLog({ outcome: 'parked' })[0]!;
+    expect(parked.reason).toContain(runId);
+    expect(parked.reason).toContain(new Date((NOW_S + 600) * 1000).toISOString());
+    expect(alert.alerts).toHaveLength(1);
+    expect(alert.alerts[0]!.reason).toMatch(/^parked/);
+    expect(alert.alerts[0]).toMatchObject({ flowId: 'github-sync', channel: '#gh', eventId: 'evt-1' });
+    expect(slots.inFlightCount()).toBe(0);
+  });
+
+  it('still fails a nonzero exit whose run is NOT parked (a row that only claims to be, with cards working)', async () => {
+    const spawn = launchingSpawn();
+    const alert = recordingAlert();
+    const runId = deriveIngressRunId('evt-1');
+
+    await runSpawnPath(
+      { db, spawn: spawn.seam, alert: alert.seam, globalAlertChannel: '#l', redriveCap: 3, now: () => NOW_MS },
+      baseInput(),
+    );
+    parkRun(runId, NOW_S + 600);
+    db.getStateDb().prepare("UPDATE cards SET status = 'working' WHERE run_id = $r").run({ $r: runId });
+    spawn.exit(1);
+    await settleExitWatcher();
+
+    expect(db.getIngressEvent('evt-1')!.spawn_state).toBe('failed');
+    expect(db.getIngressLog().map((e) => e.outcome)).toEqual(['accepted', 'spawn_failed']);
+    expect(alert.alerts[0]!.reason).toBe('conduit run exited with code 1');
+  });
+});

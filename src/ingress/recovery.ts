@@ -37,6 +37,7 @@
  */
 
 import type { ConduitDB, IngressEventRecord } from '../persistence/db';
+import { inspectParkedRun, recordPark } from './parked';
 import type { RunSlots } from './run-slots';
 import type { AlertSeam, SpawnExit } from './spawn';
 
@@ -118,6 +119,11 @@ export interface RedriveDeps {
    * When absent, sweeping is ungated (before listener backpressure behavior).
    */
   slots?: RunSlots;
+  /**
+   * Listener clock, unix MILLISECONDS (issue #7): the exit watcher reads it to
+   * confirm a parked run against its cards. Defaults to Date.now.
+   */
+  now?: () => number;
 }
 
 export interface RedriveReport {
@@ -148,7 +154,7 @@ export interface RedriveReport {
  * Returns a summary report of all outcomes.
  */
 export async function redriveOnBoot(deps: RedriveDeps): Promise<RedriveReport> {
-  const { db, respawn, cap, source = 'boot-recovery', slots, alerts } = deps;
+  const { db, respawn, cap, source = 'boot-recovery', slots, alerts, now = Date.now } = deps;
 
   const report: RedriveReport = { spawned: [], failed: [], permanentlyFailed: [], deferred: [] };
 
@@ -219,7 +225,7 @@ export async function redriveOnBoot(deps: RedriveDeps): Promise<RedriveReport> {
       if (launch.result === 'spawned' && launch.exited !== undefined) {
         slotHandedOff = true;
         void watchRedrivenChildExit(
-          { db, source, ...(alerts !== undefined && { alerts }), ...(slots !== undefined && { slots }) },
+          { db, source, now, ...(alerts !== undefined && { alerts }), ...(slots !== undefined && { slots }) },
           event,
           launch.exited,
         );
@@ -249,13 +255,18 @@ function normalizeRedriveLaunch(value: RedriveResult | RedriveLaunch): RedriveLa
  * dies is visible rather than silently stuck at 'spawned'. Attempts are NOT
  * touched: the attempt was counted before the launch. Never rejects (it runs
  * detached); always frees the slot.
+ *
+ * A PARKED run exits non-zero too (issue #7) and is not a failure: the row
+ * stays 'spawned', the log records 'parked', and the sweep resumes it once
+ * its gate passes (ingress/parked.ts). A pre-v9 row carries no run_id, so it
+ * cannot be recognised as parked and keeps the failure path.
  */
 async function watchRedrivenChildExit(
-  deps: { db: ConduitDB; source: string; alerts?: RedriveAlerting; slots?: RunSlots },
+  deps: { db: ConduitDB; source: string; now: () => number; alerts?: RedriveAlerting; slots?: RunSlots },
   event: IngressEventRecord,
   exited: Promise<SpawnExit>,
 ): Promise<void> {
-  const { db, source, alerts, slots } = deps;
+  const { db, source, now, alerts, slots } = deps;
   const eventId = event.event_id;
   try {
     let reason: string | null = null;
@@ -268,6 +279,21 @@ async function watchRedrivenChildExit(
       reason = err instanceof Error ? err.message : String(err);
     }
     if (reason === null) return; // clean exit — the row stays 'spawned'
+
+    if (event.run_id !== null) {
+      const parked = inspectParkedRun(db, event.run_id, Math.floor(now() / 1000));
+      if (parked !== null) {
+        await recordPark(db, alerts?.alert, {
+          source,
+          eventId,
+          flowId: event.flow_id ?? UNATTRIBUTED_FLOW_ID,
+          channel: resolveAlertChannel(alerts, event.flow_id),
+          runId: event.run_id,
+          releaseAt: parked.releaseAt,
+        });
+        return;
+      }
+    }
 
     // Mark → start alert → log. The alert is NOT awaited: a stalled transport
     // (a promise that never settles, not just one that throws) must never block
@@ -301,12 +327,10 @@ async function fireRedriveAlert(
 ): Promise<void> {
   if (alerts === undefined) return;
   const flowId = event.flow_id;
-  const channel =
-    (flowId !== null ? alerts.channels[flowId] : undefined) ?? alerts.globalAlertChannel;
   try {
     await alerts.alert({
       flowId: flowId ?? UNATTRIBUTED_FLOW_ID,
-      channel,
+      channel: resolveAlertChannel(alerts, flowId),
       eventId: event.event_id,
       reason,
     });
@@ -314,6 +338,16 @@ async function fireRedriveAlert(
     // Best effort — the ingress_log entry written by the caller is the durable
     // record of this failure.
   }
+}
+
+/**
+ * The hot path's channel rule: the flow's first egress target, else the
+ * listener-global channel. Empty only when there is no alerting at all, in
+ * which case nothing reads it.
+ */
+function resolveAlertChannel(alerts: RedriveAlerting | undefined, flowId: string | null): string {
+  if (alerts === undefined) return '';
+  return (flowId !== null ? alerts.channels[flowId] : undefined) ?? alerts.globalAlertChannel;
 }
 
 // ---------------------------------------------------------------------------
@@ -343,6 +377,12 @@ export interface PeriodicRedriveDeps extends Omit<RedriveDeps, 'source'> {
   schedule?: (tick: () => void, ms: number) => { cancel(): void };
   /** Per-sweep observability sink (default: silent). */
   onSweep?: (report: RedriveReport) => void;
+  /**
+   * Runs after each sweep, inside the same serialisation (issue #7): the
+   * listener resumes due parked runs here, so the one schedule and its
+   * slot-release kick drive both re-drives and resumes — no second timer.
+   */
+  afterSweep?: () => Promise<unknown>;
 }
 
 /**
@@ -358,7 +398,7 @@ export interface PeriodicRedriveDeps extends Omit<RedriveDeps, 'source'> {
  * skipped — attempts stay bounded even when a sweep outlives the interval.
  */
 export function startPeriodicRedrive(deps: PeriodicRedriveDeps): PeriodicRedrive {
-  const { db, respawn, cap, intervalMs, onSweep, slots, alerts } = deps;
+  const { db, respawn, cap, intervalMs, onSweep, afterSweep, slots, alerts, now } = deps;
   const schedule =
     deps.schedule ??
     ((tick: () => void, ms: number) => {
@@ -380,9 +420,18 @@ export function startPeriodicRedrive(deps: PeriodicRedriveDeps): PeriodicRedrive
       source: 'periodic-recovery',
       ...(slots !== undefined && { slots }),
       ...(alerts !== undefined && { alerts }),
+      ...(now !== undefined && { now }),
     })
-      .then((report) => {
-        if (!stopped) onSweep?.(report);
+      .then(async (report) => {
+        if (stopped) return;
+        onSweep?.(report);
+        try {
+          await afterSweep?.();
+        } catch {
+          // A persistence error in the parked-run resume must not become an
+          // unhandled rejection that wedges the loop — the next tick sweeps
+          // again, the same discipline as the detached exit watchers.
+        }
       })
       .finally(() => {
         sweepInFlight = false;
