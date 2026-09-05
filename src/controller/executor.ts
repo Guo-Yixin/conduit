@@ -69,7 +69,8 @@ import {
 import type { FlowGraph } from '../checkpoint/checkpoint';
 import { checkIntegrity } from '../worker/integrity';
 import type { IntegrityResult } from '../worker/integrity';
-import { checkConsumptionAndon, checkLiveness, planDrain } from '../control/watchdog';
+import { checkConsumptionAndon, checkLiveness, planDrain, type ConsumptionAndon } from '../control/watchdog';
+import { formatReleaseAt } from '../run/run-state';
 import type { WorkerSlot } from '../control/watchdog';
 import { transition } from '../statemachine/transitions';
 import type { FsmState, TransitionContext } from '../statemachine/transitions';
@@ -890,7 +891,7 @@ export async function runExecutor(args: RunEngineArgs): Promise<void> {
         if (gateAndon.tripped) {
           if (!andonTripped) {
             andonTripped = true;
-            io.err(`andon: run halted — ${gateAndon.reason} budget exceeded`);
+            io.err(consumptionHaltMessage(gateAndon.reason, rateLimitGate(db, stateDb, runId, currentNow)));
           }
           halted = true;
           break;
@@ -1238,7 +1239,10 @@ export async function runExecutor(args: RunEngineArgs): Promise<void> {
     );
     if (consumptionAndon.tripped && !andonTripped) {
       andonTripped = true;
-      io.err(`andon: run halted — ${consumptionAndon.reason} budget exceeded`);
+      // This check follows the action batch, so it — not the release-gate
+      // wait — is what usually fires when a card has JUST re-parked past the
+      // budget. Both sites report through the same helper.
+      io.err(consumptionHaltMessage(consumptionAndon.reason, rateLimitGate(db, stateDb, runId, currentNow)));
 
       const { n: activeCountNow } = stateDb
         .prepare('SELECT COUNT(*) AS n FROM active_workers WHERE run_id = $runId')
@@ -4458,6 +4462,46 @@ function parkCardUntil(
   err(
     `rate limited: card ${cardId} parked at '${stationId}' until release_at=` +
       `${releaseAtSeconds} (no attempt consumed) — ${detail}`,
+  );
+}
+
+/**
+ * The soonest `release_at` among cards parked by a PROVIDER CAP, or null when
+ * no card is. The fan-out stagger stamps the same column; only the card_log
+ * says why a card is gated — parkCardUntil records its move as 'rate_limited'.
+ */
+function rateLimitGate(db: ConduitDB, stateDb: Database, runId: string, now: number): number | null {
+  const gated = stateDb
+    .prepare(
+      `SELECT id, release_at FROM cards
+       WHERE run_id = $runId AND status = 'ready' AND release_at IS NOT NULL AND release_at > $now
+       ORDER BY release_at`,
+    )
+    .all({ $runId: runId, $now: now }) as { id: string; release_at: number }[];
+  for (const { id, release_at } of gated) {
+    const log = db.getCardLogForRun(runId, id);
+    for (let i = log.length - 1; i >= 0; i--) {
+      const entry = log[i]!;
+      if (entry.kind !== 'entered_lane') continue;
+      if (entry.reasonClass === 'rate_limited') return release_at;
+      break;
+    }
+  }
+  return null;
+}
+
+/**
+ * The consumption andon's halt line. A run halted while parked behind a
+ * provider cap did not run away — it was told to wait and could not afford to
+ * (issue #7). The generic line read as a failure, and nothing named the time
+ * after which `conduit resume` would succeed.
+ */
+function consumptionHaltMessage(reason: ConsumptionAndon['reason'], rateLimitReleaseAt: number | null): string {
+  if (rateLimitReleaseAt === null) return `andon: run halted — ${reason} budget exceeded`;
+  return (
+    `andon: run halted — ${reason} budget exceeded while parked behind a provider rate limit; ` +
+    `soonest release_at=${rateLimitReleaseAt} (${formatReleaseAt(rateLimitReleaseAt)}) — ` +
+    `cards are untouched and the run is resumable after that time`
   );
 }
 

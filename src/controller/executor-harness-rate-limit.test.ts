@@ -32,6 +32,8 @@ import {
   type HarnessInvocation,
   type HarnessRegistry,
 } from '../worker/harness-adapter';
+import { createClaudeHarnessAdapter } from '../worker/harness-adapter-claude';
+import type { HarnessSpawnResult } from '../worker/harness-runner';
 
 // ---------------------------------------------------------------------------
 // Shared executor-test recipe.
@@ -114,16 +116,34 @@ function makeScriptedHarness(
 // Flow fixture — one `coder` harness station, configurable attempt cap.
 // ---------------------------------------------------------------------------
 
+const CRITIC_MODEL = 'critic-model';
+
 function writeHarnessFlow(
   dir: string,
   registry: HarnessRegistry,
-  opts: { maxAttempts?: number; wallClockMinutes?: number } = {},
+  opts: { maxAttempts?: number; wallClockMinutes?: number; harness?: string; gated?: boolean } = {},
 ): FlowConfig {
   const maxAttempts = opts.maxAttempts ?? 2;
   const wallClockMinutes = opts.wallClockMinutes ?? 10;
+  const harness = opts.harness ?? 'fake-harness';
   mkdirSync(join(dir, 'prompts'), { recursive: true });
-  writeFileSync(join(dir, 'prompts', 'coder.md'), 'TASK: {{task.json}}');
+  // The loader rejects a {{feedback}} reference on a station nothing rejects
+  // back to, so the feedback input exists only on the gated shape.
+  writeFileSync(join(dir, 'prompts', 'coder.md'), opts.gated ? 'TASK: {{task.json}}\n{{feedback}}' : 'TASK: {{task.json}}');
+  writeFileSync(join(dir, 'prompts', 'verify.md'), 'Check {{result.json}}');
   writeFileSync(join(dir, 'task.json'), '{"task":"build the widget"}');
+
+  // Issue #7's shape needs a critic gate whose back-edge returns to the maker:
+  // the cap landed on the REWORK invocation, after the station had already
+  // succeeded once.
+  const gate = opts.gated
+    ? `
+    check:
+      kind: gate
+      critic: { role: critic, model: ${CRITIC_MODEL}, prompt_file: prompts/verify.md, prompt_version: "1" }
+      on_reject: coder
+      rework_cap: 3`
+    : '';
 
   const flowYaml = `
 flow: harness-failures
@@ -138,7 +158,7 @@ stations:
   - id: coder
     worker:
       kind: harness
-      harness: fake-harness
+      harness: ${harness}
       model: sonnet
       prompt_file: prompts/coder.md
       prompt_version: "1"
@@ -146,9 +166,9 @@ stations:
       output_schema:
         fields:
           - { name: summary, type: string, required: true }
-    inputs: [task.json]
+    inputs: [task.json${opts.gated ? ', feedback' : ''}]
     outputs: [result.json]
-    next: done
+    next: done${gate}
 `;
   writeFileSync(join(dir, 'flow.yaml'), flowYaml);
   const loaded = loadFlow(join(dir, 'flow.yaml'), { harnessRegistry: registry });
@@ -230,6 +250,7 @@ function virtualClock(startSeconds = 1000): {
   now: () => number;
   sleep: (ms: number) => Promise<void>;
   read: () => number;
+  advance: (seconds: number) => void;
 } {
   let clock = startSeconds;
   return {
@@ -238,6 +259,9 @@ function virtualClock(startSeconds = 1000): {
       clock += Math.max(1, Math.ceil(ms / 1000));
     },
     read: () => clock,
+    advance: (seconds: number) => {
+      clock += seconds;
+    },
   };
 }
 
@@ -245,10 +269,11 @@ async function run(
   flow: FlowConfig,
   registry: HarnessRegistry,
   clock = virtualClock(),
+  opts: { adapter?: ModelAdapter; io?: typeof io } = {},
 ): Promise<void> {
   await runExecutor({
     db: db!, flow, now: clock.now, sleep: clock.sleep,
-    adapter: throwingModel, io, harnessRegistry: registry,
+    adapter: opts.adapter ?? throwingModel, io: opts.io ?? io, harnessRegistry: registry,
   } as unknown as RunEngineArgs);
 }
 
@@ -267,16 +292,16 @@ function rateLimited(resetAtMs?: number): Behavior {
   } as Behavior;
 }
 
-describe('issue #3 — a 429 parks the card rather than scrapping it', () => {
-  /**
-   * A wall-clock budget small enough that the consumption andon trips at the
-   * FIRST release-gate check. That halts the run while the card is still
-   * parked, which is both what we need in order to observe the parked state and
-   * a real guarantee worth pinning: a cap longer than the run's remaining
-   * budget must halt the run, not idle it until the gate opens.
-   */
-  const HALT_AT_FIRST_GATE = { maxAttempts: 5, wallClockMinutes: 0.001 };
+/**
+ * A wall-clock budget small enough that the consumption andon trips at the
+ * FIRST release-gate check. That halts the run while the card is still
+ * parked, which is both what we need in order to observe the parked state and
+ * a real guarantee worth pinning: a cap longer than the run's remaining
+ * budget must halt the run, not idle it until the gate opens.
+ */
+const HALT_AT_FIRST_GATE = { maxAttempts: 5, wallClockMinutes: 0.001 };
 
+describe('issue #3 — a 429 parks the card rather than scrapping it', () => {
   it('does NOT scrap: the card stays at its lane, ready to run again', async () => {
     db = openDb();
     const { adapter } = makeScriptedHarness(rateLimited());
@@ -427,6 +452,176 @@ describe('issue #3 — a 429 parks the card rather than scrapping it', () => {
 
     expect(getCard(db)?.lane).toBe('scrap');
     expect(calls).toHaveLength(2);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Issue #7 — the cap lands on a REWORK invocation, through the REAL adapter.
+// ---------------------------------------------------------------------------
+
+/**
+ * The claude-headless adapter driven by a scripted SPAWN, so the classification
+ * under test is the adapter's own (`isRateLimited`), not a stubbed throw. Each
+ * spawn consumes the next scripted result (the last one repeats); a success
+ * result also writes the declared output, since the executor collects it from
+ * disk.
+ */
+function makeScriptedClaudeSpawn(
+  results: Array<Partial<HarnessSpawnResult> & { stdout: string }>,
+  onSpawn: (n: number) => void = () => {},
+): { adapter: HarnessAdapter; spawns: number } {
+  const state = { spawns: 0 };
+  const adapter = createClaudeHarnessAdapter({
+    projectRoot: process.cwd(),
+    envAllowlist: [],
+    probe: async () => ({ present: true }),
+    run: async () => {
+      const scripted = results[Math.min(state.spawns, results.length - 1)]!;
+      state.spawns++;
+      onSpawn(state.spawns);
+      if ((scripted.exitCode ?? 0) === 0) {
+        writeFileSync(join(process.cwd(), 'result.json'), JSON.stringify({ summary: 'narrated' }), 'utf-8');
+      }
+      return { exitCode: 0, stderr: '', durationMs: 1, timedOut: false, ...scripted };
+    },
+  });
+  return {
+    adapter,
+    get spawns() {
+      return state.spawns;
+    },
+  };
+}
+
+/** The CLI's warning event at 0.99 of the five-hour window, reset `resetsAt` (epoch SECONDS). */
+function warningEvent(resetsAt: number): string {
+  return JSON.stringify({
+    type: 'rate_limit_event',
+    rate_limit_info: {
+      status: 'allowed_warning', rateLimitType: 'five_hour', utilization: 0.99, resetsAt, isUsingOverage: false,
+    },
+  });
+}
+
+const SUCCESS_RESULT = JSON.stringify({
+  type: 'result', subtype: 'success', is_error: false, result: 'done', total_cost_usd: 0.01,
+  usage: { input_tokens: 10, output_tokens: 5 },
+});
+
+/** A critic that rejects its first verdict back to the maker, then passes. */
+function makeRejectOnceCritic(): ModelAdapter {
+  let rejected = false;
+  return {
+    async call(req) {
+      if (req.model !== CRITIC_MODEL) {
+        throw new Error(`unexpected model call for '${req.model}' — a harness maker must not call the model`);
+      }
+      const verdict = rejected
+        ? { verdict: 'pass', findings: [] }
+        : { verdict: 'reject', findings: ['tighten the second paragraph'], return_to: 'coder' };
+      rejected = true;
+      return { text: JSON.stringify(verdict), inputTokens: 5, outputTokens: 5, costUsd: 0.001 };
+    },
+  };
+}
+
+describe('issue #7 — a cap on the REWORK invocation parks the card (real adapter classification)', () => {
+  /** Thirty minutes out in REAL time, so the park lands on the provider's reset, not the default. */
+  const RESET_IN_SECONDS = 1800;
+
+  it('parks at the same lane with no attempt consumed, instead of scrapping the run', async () => {
+    db = openDb();
+    const clock = virtualClock(1000);
+    const resetsAt = Math.floor(Date.now() / 1000) + RESET_IN_SECONDS;
+    const claude = makeScriptedClaudeSpawn(
+      [
+        // First invocation succeeds at 0.99 utilization (the journal's allowed_warning).
+        { stdout: [warningEvent(resetsAt), SUCCESS_RESULT].join('\n') },
+        // The rework invocation dies on the cap: the kept warning line is all stdout
+        // holds, there is NO result event, and the cap is named only on stderr.
+        { stdout: warningEvent(resetsAt), exitCode: 1, stderr: "You've hit your usage limit · resets 8pm (UTC)" },
+      ],
+      // Real invocations take time. Moving the clock past the tiny wall-clock
+      // budget here makes the andon trip at the FIRST gate check, so the state
+      // under inspection is the first park — not a re-park after sleeping to it.
+      () => clock.advance(10),
+    );
+    const registry = createHarnessRegistry([claude.adapter]);
+    const flow = writeHarnessFlow(projectDir, registry, {
+      ...HALT_AT_FIRST_GATE, harness: 'claude-headless', gated: true,
+    });
+    seedCoderCard(db);
+
+    await run(flow, registry, clock, { adapter: makeRejectOnceCritic() });
+
+    const card = getCard(db);
+    // The reported end state was lane=scrap, status=scrapped — the whole run
+    // lost to a valid rework with no headroom.
+    expect(card?.lane).toBe('coder');
+    expect(card?.status).toBe('ready');
+    // attempt=1 is the REWORK's own bump (advanceCard keys the next checkpoint
+    // on it); the park added nothing on top, and the rework counter shows the
+    // one legitimate reject.
+    expect(card?.attempt).toBe(1);
+    expect(card?.rework_count).toBe(1);
+    expect(terminalReasons(db)).toEqual([]);
+    // Parked, and on the provider's reset: 1800s ahead in the injected frame,
+    // not the 300s default a missing reset would fall back to. The park samples
+    // now() after the invoke, so its base lands inside the 10s the spawn advanced.
+    const releaseAt = releaseAtOf(db) ?? 0;
+    expect(releaseAt).toBeGreaterThanOrEqual(1000 + RESET_IN_SECONDS - 1);
+    expect(releaseAt).toBeLessThanOrEqual(1010 + RESET_IN_SECONDS + 2);
+    // One real run, one capped rework — never a retry loop burning the cap.
+    expect(claude.spawns).toBe(2);
+  });
+
+  it('CONTRAST: the same rework crash with an unrelated stderr still scraps', async () => {
+    db = openDb();
+    const resetsAt = Math.floor(Date.now() / 1000) + RESET_IN_SECONDS;
+    const claude = makeScriptedClaudeSpawn([
+      { stdout: [warningEvent(resetsAt), SUCCESS_RESULT].join('\n') },
+      { stdout: warningEvent(resetsAt), exitCode: 1, stderr: 'segfault' },
+    ]);
+    const registry = createHarnessRegistry([claude.adapter]);
+    const flow = writeHarnessFlow(projectDir, registry, { maxAttempts: 2, harness: 'claude-headless', gated: true });
+    seedCoderCard(db);
+
+    await run(flow, registry, virtualClock(1000), { adapter: makeRejectOnceCritic() });
+
+    expect(getCard(db)?.lane).toBe('scrap');
+    expect(terminalReasons(db)).toContain('harness-nonzero-exit');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Issue #7 — a run that cannot afford to wait out the cap halts as PARKED.
+// ---------------------------------------------------------------------------
+
+describe('issue #7 — the andon halt during a rate-limit park is reported as parked', () => {
+  it('names the gate on stderr as ISO-8601 UTC and leaves the card exactly as parked', async () => {
+    db = openDb();
+    const clock = virtualClock(1000);
+    const { adapter } = makeScriptedHarness(rateLimited());
+    const registry = createHarnessRegistry([adapter]);
+    const flow = writeHarnessFlow(projectDir, registry, HALT_AT_FIRST_GATE);
+    seedCoderCard(db);
+    const errors: string[] = [];
+
+    await run(flow, registry, clock, { io: { out: () => {}, err: (l) => errors.push(l) } });
+
+    // The old line — "andon: run halted — wall_clock budget exceeded" — read as
+    // a runaway. This run did no work at all: it was told to wait, could not
+    // afford to, and stopped with every card intact.
+    const releaseAt = releaseAtOf(db);
+    expect(releaseAt).not.toBeNull();
+    const andon = errors.find((l) => /^andon:/.test(l));
+    expect(andon).toMatch(/parked behind a provider rate limit/);
+    expect(andon).toContain(new Date(releaseAt! * 1000).toISOString());
+    const card = getCard(db);
+    expect(card?.lane).toBe('coder');
+    expect(card?.status).toBe('ready');
+    expect(card?.attempt).toBe(0);
+    expect(releaseAt!).toBeGreaterThan(clock.read());
   });
 });
 

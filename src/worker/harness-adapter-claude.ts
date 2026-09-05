@@ -235,21 +235,34 @@ const RATE_LIMIT_TEXT = /rate limit|rate_limit|session limit|usage limit|too man
  * Did this failed invocation fail because of a provider cap?
  *
  * Ordered most to least authoritative. The structured status is the only one
- * confirmed against a genuine cap; the other two exist so that a CLI which
+ * confirmed against a genuine cap; the others exist so that a CLI which
  * reports the same condition differently still parks rather than scraps.
+ *
+ * Deliberately NOT given stdout. It is the FILTERED stream — only `result` and
+ * `rate_limit_event` lines survive the spawn's line filter — so there is
+ * nothing in it to text-match beyond what `payload` and `rateLimit` already
+ * carry, and its content says nothing about whether stderr should be read.
+ * Issue #7 was exactly that mistake: a kept `allowed_warning` event made
+ * stdout non-empty, the CLI then died on the cap without a result event, and
+ * the stderr line naming the cap was skipped because stdout "had something".
  */
 export function isRateLimited(
   payload: ClaudeResultPayload | null,
   rateLimit: RateLimitSnapshot | undefined,
-  stdout: string,
   stderr: string,
 ): boolean {
   if (payload?.api_error_status === 429) return true;
   if (rateLimit?.status !== undefined && BLOCKED_RATE_LIMIT_STATUSES.has(rateLimit.status)) return true;
+  // A window the last capacity reading shows fully consumed IS the cap, whatever
+  // status label was attached — but only when the CLI died without a result
+  // event. A result payload that exists and names another cause keeps its say.
+  if (payload === null && rateLimit !== undefined && rateLimit.windows.some((w) => w.utilization >= 1)) {
+    return true;
+  }
   // Text is the LAST resort and only over the result field or a short stderr —
-  // never the whole transcript, which could contain the phrase incidentally in
-  // a tool output or a file the agent happened to read.
-  const text = payload?.result ?? (stdout.length === 0 ? stderr.slice(0, 500) : '');
+  // never a transcript, which could contain the phrase incidentally in a tool
+  // output or a file the agent happened to read.
+  const text = payload?.result ?? stderr.slice(0, 500);
   return text.length > 0 && RATE_LIMIT_TEXT.test(text);
 }
 
@@ -367,7 +380,7 @@ export function createClaudeHarnessAdapter(config: ClaudeHarnessAdapterConfig): 
         // scrap — leaving issue #3 open under the exact condition it was filed
         // for. Degrading into a park is the safe direction: the worst case is
         // one short wait before the card runs again.
-        if (isRateLimited(payload, rateLimit, spawnResult.stdout, spawnResult.stderr)) {
+        if (isRateLimited(payload, rateLimit, spawnResult.stderr)) {
           const resetAtMs = bindingResetAtMs(rateLimit);
           fail(
             `provider rate limit: ${payload?.result ?? rateLimit?.status ?? 'no detail reported'}`,
