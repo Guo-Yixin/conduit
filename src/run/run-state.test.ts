@@ -89,6 +89,7 @@ function holdCard(card: Card, reason: string): void {
   });
 }
 
+/** Move `card` to a terminal lane, so no unfinished card remains to be parked. */
 function terminalCard(card: Card, lane: 'done' | 'scrap'): void {
   const stateDb = db.getStateDb();
   stateDb

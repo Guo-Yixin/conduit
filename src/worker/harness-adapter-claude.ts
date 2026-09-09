@@ -300,6 +300,7 @@ function fail(reason: string, code?: string, detail?: Record<string, unknown>): 
   );
 }
 
+/** Is the harness CLI on PATH? The detail is the resolved path, or why not. */
 async function defaultProbe(command: string): Promise<BinaryProbe> {
   const resolved = Bun.which(command);
   return resolved !== null
@@ -307,6 +308,11 @@ async function defaultProbe(command: string): Promise<BinaryProbe> {
     : { present: false, detail: `'${command}' not found on PATH` };
 }
 
+/**
+ * Build the `claude-headless` adapter: the Claude Code CLI wrapped as a harness
+ * station worker. Every collaborator (`command`, `run`, `probe`) is injectable
+ * so the tests can drive the adapter without spawning a real binary.
+ */
 export function createClaudeHarnessAdapter(config: ClaudeHarnessAdapterConfig): HarnessAdapter {
   const command = config.command ?? 'claude';
   const run = config.run ?? runHarnessProcess;

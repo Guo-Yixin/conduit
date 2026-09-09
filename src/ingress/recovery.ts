@@ -37,9 +37,14 @@
  */
 
 import type { ConduitDB, IngressEventRecord } from '../persistence/db';
+import {
+  resolveAlertChannel,
+  UNATTRIBUTED_FLOW_ID,
+  type RedriveAlerting,
+} from './alert-channel';
 import { inspectParkedRun, recordPark } from './parked';
 import type { RunSlots } from './run-slots';
-import type { AlertSeam, SpawnExit } from './spawn';
+import type { SpawnExit } from './spawn';
 
 // ---------------------------------------------------------------------------
 // Public types
@@ -81,20 +86,7 @@ export type RespawnSeam = (event: IngressEventRecord) => Promise<RedriveResult |
  * owning flow is unknown here — a pre-v9 row with a null flow_id, or a flow
  * that was quarantined after the row was accepted.
  */
-export interface RedriveAlerting {
-  alert: AlertSeam;
-  /** flowId → resolved alert channel (flow egress[0].target ?? globalAlertChannel). */
-  channels: Record<string, string>;
-  /** Listener-global fallback target. */
-  globalAlertChannel: string;
-}
-
-/**
- * flow_id on a pre-v9 ingress_events row is null — the attribution columns did
- * not exist when it was accepted. Alert anyway (silence is the bug being fixed
- * here) with an explicit placeholder rather than guessing an owning flow.
- */
-const UNATTRIBUTED_FLOW_ID = 'unknown';
+export type { RedriveAlerting } from './alert-channel';
 
 export interface RedriveDeps {
   db: ConduitDB;
@@ -338,16 +330,6 @@ async function fireRedriveAlert(
     // Best effort — the ingress_log entry written by the caller is the durable
     // record of this failure.
   }
-}
-
-/**
- * The hot path's channel rule: the flow's first egress target, else the
- * listener-global channel. Empty only when there is no alerting at all, in
- * which case nothing reads it.
- */
-function resolveAlertChannel(alerts: RedriveAlerting | undefined, flowId: string | null): string {
-  if (alerts === undefined) return '';
-  return (flowId !== null ? alerts.channels[flowId] : undefined) ?? alerts.globalAlertChannel;
 }
 
 // ---------------------------------------------------------------------------

@@ -125,6 +125,7 @@ function makeAdapter(
   });
 }
 
+/** A complete harness invocation; `over` names only the field under test. */
 function invocation(over: Partial<HarnessInvocation> = {}): HarnessInvocation {
   return {
     prompt: 'Implement the task described in task.md',

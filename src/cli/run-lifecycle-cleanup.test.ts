@@ -422,6 +422,10 @@ stations:
   return flowPath;
 }
 
+/**
+ * CLI deps wired to the rate-limit-capped harness and a virtual clock, so a
+ * park's wait is instant and the test observes the real executor path.
+ */
 function parkingDeps(clock: ReturnType<typeof virtualClock>, adapter: ModelAdapter = stubAdapter): CliDeps {
   return {
     ...makeDeps(),
@@ -502,6 +506,11 @@ const proposalAdapter: ModelAdapter = {
   },
 };
 
+/**
+ * The single card of `runId`, read raw. `attempt` and `release_at` are the two
+ * fields a park must move together: the gate is stamped, the attempt is not
+ * spent.
+ */
 function parkedCard(runId: string): { lane: string; status: string; attempt: number; release_at: number | null } {
   return db
     .getStateDb()

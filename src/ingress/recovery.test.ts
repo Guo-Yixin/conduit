@@ -125,6 +125,7 @@ function recordingRespawn(resultFor: (eventId: string) => RedriveResult): Respaw
 }
 
 const allSpawn = (): RedriveResult => 'spawned';
+/** Every re-drive fails transiently — the attempt-capped path. */
 const allTransient = (): RedriveResult => 'transient_failure';
 
 // ===========================================================================

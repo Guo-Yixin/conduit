@@ -130,6 +130,11 @@ function filterValue(value: unknown): unknown {
   return value;
 }
 
+/**
+ * Strip secrets out of an attribute bag before it is persisted to the journal.
+ * A sensitive key drops its whole subtree, not just a scalar, so a token nested
+ * under `credentials` cannot survive by being one level deeper.
+ */
 export function filterAttributes(attrs: Record<string, unknown>): Record<string, unknown> {
   const safe: Record<string, unknown> = {};
   for (const [key, value] of Object.entries(attrs)) {
@@ -656,6 +661,12 @@ interface RawIngressEventRow {
   substrate_json: string | null;
 }
 
+/**
+ * Project a raw ingress_events row onto the record the listener reads, naming
+ * the `spawn_state` column's string as the state union. Attribution columns
+ * (`flow_id`, `flow_path`, `run_id`) are nullable because a pre-v9 row predates
+ * them — callers must handle the null rather than assume an owning flow.
+ */
 function toIngressEventRecord(row: RawIngressEventRow): IngressEventRecord {
   return {
     event_id: row.event_id,

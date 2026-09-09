@@ -519,6 +519,7 @@ function makeFakeSocketSeam() {
   return { seam, connections, openCalls };
 }
 
+/** A Slack ingress binding on the socket transport, as it appears in flow.yaml. */
 function socketIngress(channel: string, appTokenEnv = 'SLACK_APP_TOKEN'): Record<string, unknown> {
   return {
     type: 'slack',

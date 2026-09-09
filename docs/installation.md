@@ -494,9 +494,34 @@ docker run --rm \
   branching-flow run /flow/flow.yaml
 ```
 
-The engine drives the flow to a terminal lane (`done`, `scrap`, or `hold`) and
-exits 0. State is persisted in `conduit_data:/data/conduit.sqlite` and survives
-container restarts.
+The engine drives the flow to a terminal lane (`done`, `scrap`, or `hold`).
+It exits 0 when the work reached `done` and 1 when it did not. State is
+persisted in `conduit_data:/data/conduit.sqlite` and survives container
+restarts.
+
+Exit 1 is not always a failure. A run that stopped because every unfinished
+card is waiting out a provider rate limit is recorded as **parked**: nothing was
+scrapped, and the run stays resumable. It prints the gate time and the exact
+command that continues it:
+
+```
+run "job-1" parked behind a provider rate limit until 2026-01-01T00:10:00.000Z
+  — nothing was scrapped; resume with: conduit resume /flow/flow.yaml --run job-1
+```
+
+Run that command once the gate has passed to pick the run up where it stopped:
+
+```bash
+docker run --rm \
+  -v conduit_data:/data \
+  -e CONDUIT_API_KEY \
+  -e CONDUIT_BASE_URL \
+  branching-flow resume /flow/flow.yaml --run job-1
+```
+
+Under the operator stack the listener does this for you — it recognises a
+parked child, tells the channel once, and resumes the run itself when the gate
+passes (see [`ingress-listener.md`](./ingress-listener.md)).
 
 ### Alternative: run from the engine image during development
 

@@ -787,6 +787,16 @@ function printHaltedRunSummary(deps: CliDeps, runId: string): void {
 // Command handlers
 // ---------------------------------------------------------------------------
 
+/**
+ * `conduit run <flow.yaml>` — seed a run (or pick up an existing one by
+ * `--run-id`) and drive the engine to a terminal state.
+ *
+ * Exit code is the run's verdict (FR-12): 0 when the work reached `done`, 1
+ * otherwise. "Otherwise" is not always a failure — a run every unfinished card
+ * of which is parked behind a provider reset exits 1 too, and is recorded
+ * `outcome='parked'` so it stays resumable. Only a genuinely halted run gets
+ * the stuck-card summary; a parked one has no failed card to list.
+ */
 async function cmdRun(argv: string[], deps: CliDeps): Promise<number> {
   // ── Parse flags: run <flow.yaml> [--input <file>] [--input-inline <text>] [--concurrency <n>] [--run-id <id>] [--project-root <dir>] ──
   let flowPath: string | undefined;
@@ -1237,6 +1247,16 @@ async function cmdRun(argv: string[], deps: CliDeps): Promise<number> {
   return completed ? 0 : 1;
 }
 
+/**
+ * `conduit resume <flow.yaml>` — re-drive a run that stopped before its work
+ * was done, whether it was interrupted, halted, or parked on a rate limit.
+ *
+ * Resume runs in a FRESH process, so it first repairs what the dead one left
+ * behind: orphaned in-flight workers are reclaimed to `interrupted`, and any
+ * pending outbox intent is escalated to `hold` rather than blind-retried
+ * (SPEC §5) — a human decides whether the effect landed. Then the engine runs,
+ * and the exit code carries the same verdict as `cmdRun`.
+ */
 async function cmdResume(argv: string[], deps: CliDeps): Promise<number> {
   // Parse: resume [--rebind] [--run <id>] [--concurrency <n>] [--project-root <dir>] <flow.yaml>
   let hasRebind = false;

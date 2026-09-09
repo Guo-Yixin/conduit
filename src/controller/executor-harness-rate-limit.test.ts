@@ -67,6 +67,12 @@ type Behavior =
   | { kind: 'invalid' }
   | { kind: 'throw'; code?: string; message: string };
 
+/**
+ * A harness adapter that replays `behaviors` in order, holding the last one
+ * once the script runs out — so a test can say "rate-limit the first call, then
+ * succeed" and let the executor drive as many calls as it needs. Every
+ * invocation is recorded for assertions about what the station was asked to do.
+ */
 function makeScriptedHarness(
   behaviors: Behavior | Behavior[],
   opts: { name?: string; outputName?: string } = {},
@@ -118,6 +124,11 @@ function makeScriptedHarness(
 
 const CRITIC_MODEL = 'critic-model';
 
+/**
+ * Write a one-harness-station flow to `dir`, optionally `gated` (a check with a
+ * back-edge, so a rate limit can land on a REWORK invocation — the case issue
+ * #7 is about) and with the attempt/wall-clock budgets under test.
+ */
 function writeHarnessFlow(
   dir: string,
   registry: HarnessRegistry,
@@ -265,6 +276,7 @@ function virtualClock(startSeconds = 1000): {
   };
 }
 
+/** Drive the real executor over `flow` on a virtual clock. */
 async function run(
   flow: FlowConfig,
   registry: HarnessRegistry,

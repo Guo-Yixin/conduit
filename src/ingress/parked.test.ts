@@ -70,16 +70,22 @@ function parkRun(runId: string, releaseAt: number, cardId = 'c1'): void {
     .run({ $at: releaseAt, $r: runId, $c: cardId });
 }
 
+/** Drive `runId` to the completed terminal — cards at `done`, run row `complete`. */
 function completeRun(runId: string): void {
   db.getStateDb().prepare("UPDATE cards SET lane = 'done', status = 'complete', release_at = NULL WHERE run_id = $r").run({ $r: runId });
   db.getStateDb().prepare("UPDATE runs SET status = 'done', outcome = 'complete' WHERE run_id = $r").run({ $r: runId });
 }
 
+/**
+ * Drive `runId` to a genuinely halted terminal (scrapped cards, `outcome`
+ * NOT 'parked') — the case that must never be mistaken for a park.
+ */
 function scrapRun(runId: string): void {
   db.getStateDb().prepare("UPDATE cards SET lane = 'scrap', status = 'scrapped', release_at = NULL WHERE run_id = $r").run({ $r: runId });
   db.getStateDb().prepare("UPDATE runs SET status = 'halted', outcome = 'halted' WHERE run_id = $r").run({ $r: runId });
 }
 
+/** An alert seam that records what the channel was told, in order. */
 function recordingAlert(): { seam: (a: SpawnFailedAlert) => Promise<void>; alerts: SpawnFailedAlert[] } {
   const alerts: SpawnFailedAlert[] = [];
   return { alerts, seam: async (a) => { alerts.push(a); } };
@@ -104,6 +110,7 @@ function launchingResume(): {
   };
 }
 
+/** Yield to the microtask/timer queue so a detached supervisor can finish. */
 const settle = (): Promise<void> => new Promise((resolve) => setTimeout(resolve, 0));
 
 // ===========================================================================

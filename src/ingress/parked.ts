@@ -39,8 +39,12 @@
 import type { ConduitDB } from '../persistence/db';
 import { formatReleaseAt, getRunParkedRelease } from '../run/run-state';
 import type { HitlResumeSpawn } from './adapters/slack-events';
+import {
+  resolveAlertChannel,
+  UNATTRIBUTED_FLOW_ID,
+  type RedriveAlerting,
+} from './alert-channel';
 import { startGatedResume } from './gated-resume';
-import type { RedriveAlerting } from './recovery';
 import type { RunSlots } from './run-slots';
 import type { AlertSeam } from './spawn';
 
@@ -258,8 +262,8 @@ async function superviseResume(deps: ParkedResumeDeps, run: DueParkedRun): Promi
       await recordPark(db, alerts?.alert, {
         source: PARKED_RESUME_SOURCE,
         eventId,
-        flowId: flowId ?? 'unknown',
-        channel: resolveChannel(alerts, flowId),
+        flowId: flowId ?? UNATTRIBUTED_FLOW_ID,
+        channel: resolveAlertChannel(alerts, flowId),
         runId,
         releaseAt: parkedAgain.releaseAt,
       });
@@ -275,7 +279,12 @@ async function superviseResume(deps: ParkedResumeDeps, run: DueParkedRun): Promi
     db.markIngressFailed(eventId);
     if (alerts !== undefined) {
       try {
-        await alerts.alert({ flowId: flowId ?? 'unknown', channel: resolveChannel(alerts, flowId), eventId, reason });
+        await alerts.alert({
+          flowId: flowId ?? UNATTRIBUTED_FLOW_ID,
+          channel: resolveAlertChannel(alerts, flowId),
+          eventId,
+          reason,
+        });
       } catch {
         // Best effort — the log entry below is the durable record.
       }
@@ -284,10 +293,4 @@ async function superviseResume(deps: ParkedResumeDeps, run: DueParkedRun): Promi
   } catch {
     // Persistence failure in a detached supervisor — nothing left to report to.
   }
-}
-
-/** Empty only when there is no alerting at all, in which case nothing reads it. */
-function resolveChannel(alerts: RedriveAlerting | undefined, flowId: string | null): string {
-  if (alerts === undefined) return '';
-  return (flowId !== null ? alerts.channels[flowId] : undefined) ?? alerts.globalAlertChannel;
 }
