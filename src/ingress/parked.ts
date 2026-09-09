@@ -46,7 +46,7 @@ import {
 } from './alert-channel';
 import { startGatedResume } from './gated-resume';
 import type { RunSlots } from './run-slots';
-import type { AlertSeam } from './spawn';
+import type { AlertSeam, SpawnFailedAlert } from './spawn';
 
 /** ingress_log source for the sweep-driven resumes. */
 const PARKED_RESUME_SOURCE = 'parked-resume';
@@ -102,6 +102,9 @@ export interface ParkNotice {
  * and needs no state of its own. Informational — it never marks the event
  * failed, and a dead alert transport never throws past here. A caller with no
  * alert seam (a unit-level re-drive driver) just gets the log entry.
+ *
+ * Resolves once the LOG is durable; the alert is started but not awaited, so a
+ * transport that never settles cannot hold up the caller (see below).
  */
 export async function recordPark(db: ConduitDB, alert: AlertSeam | undefined, notice: ParkNotice): Promise<void> {
   const { source, eventId, flowId, channel, runId, releaseAt } = notice;
@@ -114,15 +117,26 @@ export async function recordPark(db: ConduitDB, alert: AlertSeam | undefined, no
     reason: `run '${runId}' parked behind a provider rate limit until ${gate} — the listener resumes it once the gate passes`,
   });
   if (alreadyTold || alert === undefined) return;
+  // Started, NOT awaited — the same rule the failure path follows in
+  // recovery.ts's watchRedrivenChildExit, which calls this and then releases the
+  // run slot in a finally. A transport that never SETTLES (not merely one that
+  // throws) would otherwise pin that slot for the life of the listener and
+  // defer every later launch. The ingress_log entry above is already durable,
+  // so waiting for the send buys nothing.
+  void fireParkAlert(alert, {
+    flowId,
+    channel,
+    eventId,
+    reason: `parked: run '${runId}' is waiting on a provider rate limit until ${gate} and will resume on its own`,
+  });
+}
+
+/** Tell the channel about a park — best effort, and never rejects on its caller. */
+async function fireParkAlert(alert: AlertSeam, notice: SpawnFailedAlert): Promise<void> {
   try {
-    await alert({
-      flowId,
-      channel,
-      eventId,
-      reason: `parked: run '${runId}' is waiting on a provider rate limit until ${gate} and will resume on its own`,
-    });
+    await alert(notice);
   } catch {
-    // Best effort — the log entry above is the durable record.
+    // Best effort — the ingress_log 'parked' entry is the durable record.
   }
 }
 

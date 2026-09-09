@@ -504,7 +504,7 @@ card is waiting out a provider rate limit is recorded as **parked**: nothing was
 scrapped, and the run stays resumable. It prints the gate time and the exact
 command that continues it:
 
-```
+```text
 run "job-1" parked behind a provider rate limit until 2026-01-01T00:10:00.000Z
   — nothing was scrapped; resume with: conduit resume /flow/flow.yaml --run job-1
 ```

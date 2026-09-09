@@ -1099,6 +1099,40 @@ describe('re-driven exit watcher × parked run (issue #7)', () => {
     expect(slots.inFlightCount()).toBe(0);
   });
 
+  it('does not hold the run slot on a park alert that never settles', async () => {
+    // The failure path already refuses to await its alert (see the exit-watcher
+    // test above) because the watcher releases the slot in a finally AFTER it.
+    // The park path runs through the same finally, so a stalled transport there
+    // would pin the slot for the life of the listener and defer every later
+    // launch — the durable ingress_log entry is written before the alert, so
+    // waiting for the send buys nothing.
+    seedFailedAttributed('e-park-hang', 'run-park-hang');
+    const slots = createRunSlots({ capacity: 1 });
+    const respawn = launchingRespawn();
+    const neverSettling: RedriveAlerting = {
+      alert: async () =>
+        new Promise<void>(() => {
+          /* never settles — simulates a stalled alert transport */
+        }),
+      channels: { flowA: '#a' },
+      globalAlertChannel: '#ops',
+    };
+
+    await redriveOnBoot({ db, respawn: respawn.seam, cap: CAP, slots, alerts: neverSettling, now: () => NOW_MS });
+    parkRun('run-park-hang', NOW_S + 600);
+    respawn.exit('e-park-hang', 1);
+
+    await Promise.race([
+      settle(),
+      new Promise((_, reject) => setTimeout(() => reject(new Error('exit watcher hung on a pending park alert')), 250)),
+    ]);
+
+    // The park is recorded durably and the slot is free for the next launch.
+    expect(db.getIngressLog().map((e) => e.outcome)).toEqual(['redriven', 'parked']);
+    expect(db.getIngressEvent('e-park-hang')!.spawn_state).toBe('spawned');
+    expect(slots.inFlightCount()).toBe(0);
+  });
+
   it('keeps the failure path for a pre-v9 row with no run attribution, even if some run is parked', async () => {
     seedFailed('e-legacy', 1); // no run_id
     const respawn = launchingRespawn();
