@@ -244,8 +244,13 @@ const RATE_LIMIT_TEXT_STRONG =
 /**
  * Phrasing that USUALLY means a cap but reads the same when something merely
  * mentions one: an agent's own failed command echoed into stderr
- * (`grep -n "rate limit" README.md`) is the shape that matters. Trusted only
- * alongside a capacity reading from the CLI itself — see isRateLimited.
+ * (`grep -n "rate limit" README.md`) is the shape that matters.
+ *
+ * Used against the result payload's `result` field only, never against stderr:
+ * the result field is the CLI's own statement of why it stopped, so ambiguous
+ * phrasing there is still the CLI talking about itself rather than text the
+ * process happened to emit. See isRateLimited for why stderr gets no such
+ * benefit of the doubt.
  */
 const RATE_LIMIT_TEXT_WEAK = /rate limit|rate_limit/i;
 
@@ -264,11 +269,11 @@ const RATE_LIMIT_TEXT_WEAK = /rate limit|rate_limit/i;
  * stdout non-empty, the CLI then died on the cap without a result event, and
  * the stderr line naming the cap was skipped because stdout "had something".
  *
- * What gates the stderr path instead is `rateLimit`: the CLI has to have
- * reported capacity before its stderr is read as a cap. Misclassifying a crash
- * as a cap is no longer the cheap mistake it was when a park merely cost one
- * short wait — a park spends no execution attempt, so nothing scraps the card,
- * and the ingress listener resumes the run unattended.
+ * Stderr is trusted only on RATE_LIMIT_TEXT_STRONG, and `rateLimit` does not
+ * gate it (see the comment at that branch). Misclassifying a crash as a cap is
+ * not the cheap mistake it was when a park merely cost one short wait: a park
+ * spends no execution attempt, so nothing scraps the card, and the ingress
+ * listener resumes the run unattended.
  */
 export function isRateLimited(
   payload: ClaudeResultPayload | null,
@@ -295,15 +300,21 @@ export function isRateLimited(
   }
   // stderr is noisier: it now reaches this point on EVERY crash that produced
   // no result event, which is most of them (the old gate skipped it whenever
-  // filtered stdout had anything at all — the issue #7 bug). Unambiguous
-  // phrasing still stands alone, so a CLI that reports the cap only on stderr
-  // parks rather than scraps. Ambiguous phrasing additionally needs the CLI to
-  // have reported capacity at all, which is what separates "the provider capped
-  // me" from "a command mentioning rate limits failed".
+  // filtered stdout had anything at all — the issue #7 bug). Only unambiguous
+  // phrasing is trusted here, so a CLI that reports the cap only on stderr
+  // still parks rather than scraps.
+  //
+  // RATE_LIMIT_TEXT_WEAK is deliberately NOT tried against stderr, not even
+  // behind a capacity snapshot. That gate was tried and it gated almost
+  // nothing: the CLI emits a `rate_limit_event` on essentially every call as
+  // ordinary capacity reporting, so `rateLimit !== undefined` was true in the
+  // common case whether or not the process died on a cap. A harness crash that
+  // merely echoes the phrase (an agent's own failed
+  // `grep -n "rate limit" README.md`) then read the same as a real cap and
+  // parked instead of scrapping. Ambiguous text about something the CLI never
+  // claimed is still ambiguous, however little capacity was left.
   const text = stderr.slice(0, 500);
-  if (text.length === 0) return false;
-  if (RATE_LIMIT_TEXT_STRONG.test(text)) return true;
-  return rateLimit !== undefined && RATE_LIMIT_TEXT_WEAK.test(text);
+  return text.length > 0 && RATE_LIMIT_TEXT_STRONG.test(text);
 }
 
 /**

@@ -651,12 +651,25 @@ describe('isRateLimited', () => {
     );
   });
 
-  it('does NOT take the agent\'s own echoed command as a cap, absent any capacity reading', () => {
-    // stderr reaches the text path on every result-less crash now, so ambiguous
-    // phrasing needs the CLI to have reported capacity before it is believed.
+  it('does NOT take a capacity snapshot as evidence of a cap on ambiguous stderr text', () => {
+    // The CLI emits rate_limit_event lines routinely, for ordinary capacity
+    // reporting, so a snapshot merely existing says nothing about whether the
+    // process actually died on a cap. Only unambiguous stderr phrasing is
+    // trusted now; a snapshot changes nothing about that.
     const echoed = 'Error: command failed: grep -n "rate limit" README.md';
     expect(isRateLimited(null, undefined, echoed)).toBe(false);
-    expect(isRateLimited(null, { windows: [{ utilization: 0.4 }] } as never, echoed)).toBe(true);
+    expect(isRateLimited(null, { windows: [{ utilization: 0.4 }] } as never, echoed)).toBe(false);
+  });
+
+  it('does NOT park on a near-full window plus ambiguous stderr text', () => {
+    // 0.99 is the exact shape of the allowed_warning reading from the original
+    // incident. Even a window that close to its ceiling is not licence to
+    // believe ambiguous phrasing: the stderr text still only mentions a rate
+    // limit incidentally (an echoed grep command), and the CLI never says so
+    // itself.
+    const echoed = 'Error: command failed: grep -n "rate limit" README.md';
+    const snapshot = { windows: [{ name: 'five_hour', utilization: 0.99, resetsAtMs: 1788328800_000 }] };
+    expect(isRateLimited(null, snapshot as never, echoed)).toBe(false);
   });
 
   it('does NOT classify an ordinary crash with no cap phrasing at all', () => {
