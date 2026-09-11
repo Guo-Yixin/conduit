@@ -368,8 +368,10 @@ rate limit exits 1, but its `runs` row reads `status='halted', outcome='parked'`
 and its cards are `ready` behind a future `release_at`. Both exit watchers
 check that (the runs row, confirmed against the cards) before marking failed:
 a parked run keeps its row `spawned`, writes a `'parked'` log entry naming the
-run id and the gate (ISO-8601 UTC), and fires one informational alert per park
-sequence. It is never re-driven — `conduit run --run-id <existing>` only prints
+run id and the gate (ISO-8601 UTC), and fires one informational alert per
+event (the first park only — a long reset is chunked into several park cycles
+and the channel should not hear each one; a cap that never clears ends loudly
+instead, see below). It is never re-driven — `conduit run --run-id <existing>` only prints
 the run's state — so `spawn_attempts` is untouched.
 
 After the boot re-drive, and again after every periodic sweep (the same
@@ -393,6 +395,22 @@ end; instead the re-drive sweep's `conduit run --run-id` no-op flips the row
 back to `spawned` while counting an attempt, so the cycle is bounded by the
 cap. A parked run with no ingress attribution (a CLI-triggered run) is not the
 listener's to resume.
+
+A resume is also skipped for any event whose launch is already in flight in
+this process: the boot re-drive resolves on **launch** and marks the row
+`spawned` before the parked sweep runs, so a row it just re-drove is otherwise
+immediately a resume candidate and the two drivers race for the run lease.
+The re-drive sweep guards the same way, but registers its slot under the event
+id while a resume registers under `parked-resume:<runId>`, so the parked sweep
+checks `inFlight(eventId)` itself.
+
+**The park loop terminates.** A park spends no execution attempt, so none of
+the four rework guards bounds it, and this sweep would otherwise resume a
+permanently-capped run forever on one alert. The kernel bounds it instead: a
+card that parks `MAX_CONSECUTIVE_RATE_LIMIT_PARKS` times in a row without
+making progress hard-pauses to `hold`. A held card is not parked, so the run
+drops off this sweep and its next exit takes the ordinary failure path —
+`'failed'` + alert + `'spawn_failed'`.
 
 ### Attempt cap semantics
 

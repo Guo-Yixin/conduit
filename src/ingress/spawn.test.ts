@@ -826,6 +826,43 @@ describe('ack on accept (the original acknowledgement-on-accept work)', () => {
 // Issue #7 — a PARKED run is not a failed run
 // ===========================================================================
 
+describe('exit watcher × a failure alert that never settles (#16 review)', () => {
+  it('releases the run slot and writes spawn_failed without waiting for the transport', async () => {
+    // The watcher releases the slot in a finally AFTER the alert, and writes the
+    // durable ingress_log entry after it too. Awaiting a transport that never
+    // SETTLES (not merely one that throws) therefore pinned the slot for the
+    // life of the listener and lost the log row — at max_concurrent_runs 1,
+    // one hung Slack post is a listener that never launches again, with nothing
+    // recorded to say why. The two sibling watchers (recovery.ts's re-driven
+    // exit, parked.ts's recordPark) already refuse to await; this is the third.
+    const slots = createRunSlots({ capacity: 1 });
+    const spawn = launchingSpawn();
+    const neverSettles = async (): Promise<void> =>
+      new Promise<void>(() => {
+        /* never settles — a stalled alert transport */
+      });
+
+    await runSpawnPath(
+      { db, spawn: spawn.seam, alert: neverSettles, globalAlertChannel: '#l', redriveCap: 3, slots },
+      baseInput(),
+    );
+    expect(slots.inFlightCount()).toBe(1);
+
+    spawn.exit(1);
+    await Promise.race([
+      settleExitWatcher(),
+      new Promise((_, reject) =>
+        setTimeout(() => reject(new Error('exit watcher hung on a pending failure alert')), 250),
+      ),
+    ]);
+
+    // The durable record exists and the slot is free for the next launch.
+    expect(db.getIngressEvent('evt-1')!.spawn_state).toBe('failed');
+    expect(db.getIngressLog().map((e) => e.outcome)).toContain('spawn_failed');
+    expect(slots.inFlightCount()).toBe(0);
+  });
+});
+
 describe('exit watcher × parked run (issue #7)', () => {
   const NOW_MS = 1_700_000_000_000;
   const NOW_S = 1_700_000_000;
@@ -835,6 +872,19 @@ describe('exit watcher × parked run (issue #7)', () => {
     db.insertRun({ run_id: runId, flow: '/flows/github-sync.yaml', input_fingerprint: 'fp', status: 'halted', outcome: 'parked' });
     db.insertCard({ run_id: runId, id: 'c1', parent_id: null, lane: 'narrate', status: 'ready', attempt: 0, wave: 0, owned_paths: [], rework_count: 0 });
     db.getStateDb().prepare('UPDATE cards SET release_at = $at WHERE run_id = $r').run({ $at: releaseAt, $r: runId });
+    // A real park also records WHY the card is gated: `release_at` alone cannot
+    // distinguish a provider cap from the fan-out cache-warming stagger, which
+    // stamps the same column.
+    db.appendCardLog({
+      runId,
+      kind: 'entered_lane',
+      cardId: 'c1',
+      station: 'narrate',
+      attempt: 0,
+      sourceLane: 'narrate',
+      destLane: 'narrate',
+      reasonClass: 'rate_limited',
+    });
   }
 
   it('leaves a parked run spawned, logs parked (run id + ISO gate), and alerts informationally — never spawn_failed', async () => {

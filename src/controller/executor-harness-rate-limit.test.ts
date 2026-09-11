@@ -641,6 +641,71 @@ describe('issue #7 — the andon halt during a rate-limit park is reported as pa
 // releaseAtForRateLimit — the units/clocks conversion, pinned exactly.
 // ---------------------------------------------------------------------------
 
+describe('issue #16 review — an endless cap escalates instead of parking forever', () => {
+  it('holds the card once the consecutive parks reach the cap, sparing no attempt on the way', async () => {
+    // A park spends no execution attempt, so NONE of the four rework guards
+    // bounds it: guard #1 skips a 'rate_limited' entry by design, guard #2's
+    // counter never moves, guard #3 has no findings to compare, and guard #4
+    // halts the RUN — which the ingress listener now resumes unattended with a
+    // fresh per-process budget. Without a bound on the parks themselves, a
+    // station whose failure is misread as a cap parks, wakes, fails and parks
+    // again forever, alerting once. So it escalates to `hold` instead.
+    db = openDb();
+    const { adapter, calls } = makeScriptedHarness(rateLimited());
+    const registry = createHarnessRegistry([adapter]);
+    // A budget generous enough that the andon does not halt the run first: the
+    // bound under test is the park count, not the wall clock.
+    const flow = writeHarnessFlow(projectDir, registry, { maxAttempts: 5, wallClockMinutes: 10_000 });
+    seedCoderCard(db);
+    const attemptBefore = getCard(db)?.attempt;
+
+    await run(flow, registry, virtualClock(1000));
+
+    const card = getCard(db);
+    // Exactly the cap: eleven parks, and the twelfth cap holds instead.
+    const parks = db
+      .getJournalSpansForRun(DEFAULT_RUN_ID, 'entry')
+      .filter((x) => x.attributes.outcome === 'harness-rate-limited');
+    expect(parks.length).toBe(12);
+    expect(card?.lane).toBe('hold');
+    // Held, NOT scrapped: nothing the card produced is thrown away, and a
+    // human decides what a cap that will not clear means.
+    expect(card?.status).toBe('held');
+    expect(card?.lane).not.toBe('scrap');
+    // The escalation names the repetition rather than the last 429, so the
+    // operator can tell "still capped" from "this is not really a cap".
+    const held = db
+      .getCardLogForRun(DEFAULT_RUN_ID, 'entry')
+      .filter((e) => e.kind === 'terminal');
+    expect(held.some((e) => e.kind === 'terminal' && /times in a row/.test(e.reason))).toBe(true);
+    // Every one of those cycles was a real park: the attempt counter is
+    // untouched, which is issue #3's guarantee and must survive this bound.
+    expect(card?.attempt).toBe(attemptBefore!);
+    expect(calls.length).toBeGreaterThan(1);
+  });
+
+  it('resets the streak when the station actually runs, so an intermittent cap never escalates', async () => {
+    db = openDb();
+    // Cap, cap, then succeed. The success writes its own <station>.harness span
+    // and breaks the streak, so the card finishes instead of accumulating
+    // toward the hold.
+    const { adapter } = makeScriptedHarness([
+      rateLimited(),
+      rateLimited(),
+      { kind: 'ok', output: { summary: 'built the widget' } } as Behavior,
+    ]);
+    const registry = createHarnessRegistry([adapter]);
+    const flow = writeHarnessFlow(projectDir, registry, { maxAttempts: 5, wallClockMinutes: 10_000 });
+    seedCoderCard(db);
+
+    await run(flow, registry, virtualClock(1000));
+
+    const card = getCard(db);
+    expect(card?.lane).not.toBe('hold');
+    expect(card?.lane).toBe('done');
+  });
+});
+
 describe('releaseAtForRateLimit', () => {
   const REAL_NOW_MS = 1_700_000_000_000;
 

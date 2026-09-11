@@ -501,8 +501,9 @@ restarts.
 
 Exit 1 is not always a failure. A run that stopped because every unfinished
 card is waiting out a provider rate limit is recorded as **parked**: nothing was
-scrapped, and the run stays resumable. It prints the gate time and the exact
-command that continues it:
+scrapped, and the run stays resumable. It writes the gate time and the exact
+command that continues it to **stderr** (so a pipeline that captures only
+stdout will not see it):
 
 ```text
 run "job-1" parked behind a provider rate limit until 2026-01-01T00:10:00.000Z
@@ -519,9 +520,19 @@ docker run --rm \
   branching-flow resume /flow/flow.yaml --run job-1
 ```
 
+`conduit resume` exits 0 whenever it drove the engine at all, including when
+the run halts or parks again — non-zero is reserved for the reasons it could
+not start (an unknown run, a lease conflict, an unreadable flow). Check the
+run's own state with `conduit run status --run job-1` rather than the resume
+exit code.
+
 Under the operator stack the listener does this for you — it recognises a
 parked child, tells the channel once, and resumes the run itself when the gate
 passes (see [`ingress-listener.md`](./ingress-listener.md)).
+
+A cap that never clears does not park forever: after enough consecutive parks
+with no progress the card is hard-paused to the `hold` lane, so the run stops
+being auto-resumed and surfaces as a halt for a human to look at.
 
 ### Alternative: run from the engine image during development
 

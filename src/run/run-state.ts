@@ -33,8 +33,11 @@ const WAITING_ON_OTHER_CARDS: ReadonlySet<Status> = new Set<Status>(['waiting', 
  *
  * The single predicate behind `runs.outcome = 'parked'` (issue #7). A run
  * qualifies when at least one unfinished card is `ready` behind a `release_at`
- * still in the future, and every other unfinished card is either parked the
- * same way or waiting on other cards. Anything else — a scrap, a hold, work in
+ * still in the future THAT THE CARD_LOG ATTRIBUTES TO A PROVIDER CAP, and every
+ * other unfinished card is either scheduled the same way or waiting on other
+ * cards. A gate the card_log does not attribute to a cap — the fan-out
+ * cache-warming stagger stamps the same column — is scheduling, not a park, and
+ * a run holding only those reads as a plain halt. Anything else — a scrap, a hold, work in
  * flight, a gate already in the past with the card still not dispatched — is a
  * failure or a stall, and must keep reading as a plain halt so the operator
  * looks at it rather than merely waiting. Waiting cards with NO parked card
@@ -49,13 +52,64 @@ export function getRunParkedRelease(db: ConduitDB, runId: string, now: number): 
     .prepare("SELECT status, release_at FROM cards WHERE run_id = $r AND lane != 'done'")
     .all({ $r: runId }) as Array<{ status: Status; release_at: number | null }>;
 
-  let soonest = Infinity;
   for (const card of unfinished) {
     if (WAITING_ON_OTHER_CARDS.has(card.status)) continue;
     if (card.status !== 'ready' || card.release_at === null || card.release_at <= now) return null;
-    soonest = Math.min(soonest, card.release_at);
   }
-  return soonest === Infinity ? null : { releaseAt: soonest };
+  // Every unfinished card is scheduled rather than stuck. That alone does NOT
+  // make the run parked: a gate is only a PROVIDER cap when the card_log says
+  // so, and the fan-out stagger stamps the same column. Asking for the soonest
+  // rate-limit gate answers both questions at once — it is null when no card is
+  // capped, which is the stall/stagger case, and it is the gate to resume on
+  // otherwise. A run gated only by a stagger therefore reads as a plain halt,
+  // so the operator still gets the stuck-card summary for whatever stopped it.
+  const releaseAt = soonestRateLimitGate(db, runId, now);
+  return releaseAt === null ? null : { releaseAt };
+}
+
+/**
+ * Why a card is gated, which `cards.release_at` cannot say on its own: the
+ * fan-out cache-warming stagger stamps that column exactly as the rate-limit
+ * park does. Only the card_log records the reason — `parkCardUntil` writes its
+ * move with `reasonClass: 'rate_limited'` — so the card's latest `entered_lane`
+ * entry is the authority, and an older park further back does not count.
+ */
+function isRateLimitGated(db: ConduitDB, runId: string, cardId: string): boolean {
+  const log = db.getCardLogForRun(runId, cardId);
+  for (let i = log.length - 1; i >= 0; i--) {
+    const entry = log[i]!;
+    if (entry.kind !== 'entered_lane') continue;
+    return entry.reasonClass === 'rate_limited';
+  }
+  return false;
+}
+
+/**
+ * The soonest `release_at` among a run's cards parked by a PROVIDER CAP, or
+ * null when none is.
+ *
+ * The single implementation behind both readers: the executor's andon halt line
+ * and `getRunParkedRelease` above. They were two predicates that disagreed —
+ * the CLI read ANY `release_at` as a cap, so a run the andon halted while a
+ * fan-out stagger gated its siblings was recorded `outcome='parked'` and
+ * reported to the operator as "parked behind a provider rate limit", while the
+ * executor's line on the same halt correctly said only that the budget was
+ * exceeded. `outcome='parked'` is what puts a run on the ingress listener's
+ * unattended resume path, so the distinction decides more than wording.
+ */
+export function soonestRateLimitGate(db: ConduitDB, runId: string, now: number): number | null {
+  const gated = db
+    .getStateDb()
+    .prepare(
+      `SELECT id, release_at FROM cards
+       WHERE run_id = $r AND status = 'ready' AND release_at IS NOT NULL AND release_at > $now
+       ORDER BY release_at`,
+    )
+    .all({ $r: runId, $now: now }) as Array<{ id: string; release_at: number }>;
+  for (const { id, release_at } of gated) {
+    if (isRateLimitGated(db, runId, id)) return release_at;
+  }
+  return null;
 }
 
 /**
@@ -75,8 +129,18 @@ export function formatReleaseAt(releaseAt: number): string {
 export function formatParkedRun(runId: string, flow: string, releaseAt: number): string {
   return (
     `parked behind a provider rate limit until ${formatReleaseAt(releaseAt)} — nothing was scrapped; ` +
-    `resume with: conduit resume ${flow} --run ${runId}`
+    `resume with: conduit resume ${shellQuote(flow)} --run ${shellQuote(runId)}`
   );
+}
+
+/**
+ * Quote an argument for the copy-pasteable command above. `runs.flow` is always
+ * an absolute resolved path, so a project under `/home/me/My Flows/` produced a
+ * command that silently resolved to the wrong argv. Single quotes with the
+ * standard `'\''` escape: everything inside is literal to the shell.
+ */
+function shellQuote(value: string): string {
+  return /^[A-Za-z0-9_./:@=-]+$/.test(value) ? value : `'${value.replaceAll("'", `'\\''`)}'`;
 }
 
 /**

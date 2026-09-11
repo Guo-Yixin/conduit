@@ -228,8 +228,26 @@ export function dominantModel(
  */
 const BLOCKED_RATE_LIMIT_STATUSES = new Set(['blocked', 'rejected', 'exhausted', 'rate_limited']);
 
-/** Phrasing the CLI uses when a subscription or session cap is what stopped it. */
-const RATE_LIMIT_TEXT = /rate limit|rate_limit|session limit|usage limit|too many requests|\b429\b/i;
+/**
+ * Phrasing that means a cap AND could not plausibly be saying anything else, so
+ * it is trusted on stderr on its own.
+ *
+ * A bare `429` is deliberately absent. It used to be here, and it matched any
+ * stack trace whose first 500 bytes reached line 429 — `.../index.js:429:15`
+ * supplies the word boundaries on both sides — classifying an ordinary crash as
+ * a provider cap. A status code only means a status code next to something that
+ * says it is one.
+ */
+const RATE_LIMIT_TEXT_STRONG =
+  /session limit|usage limit|too many requests|rate[ _]limit(?:ed|s)?[ _](?:exceeded|reached|hit)|rate_limit_error|\b(?:status|code|http)\s*:?\s*429\b/i;
+
+/**
+ * Phrasing that USUALLY means a cap but reads the same when something merely
+ * mentions one: an agent's own failed command echoed into stderr
+ * (`grep -n "rate limit" README.md`) is the shape that matters. Trusted only
+ * alongside a capacity reading from the CLI itself — see isRateLimited.
+ */
+const RATE_LIMIT_TEXT_WEAK = /rate limit|rate_limit/i;
 
 /**
  * Did this failed invocation fail because of a provider cap?
@@ -245,6 +263,12 @@ const RATE_LIMIT_TEXT = /rate limit|rate_limit|session limit|usage limit|too man
  * Issue #7 was exactly that mistake: a kept `allowed_warning` event made
  * stdout non-empty, the CLI then died on the cap without a result event, and
  * the stderr line naming the cap was skipped because stdout "had something".
+ *
+ * What gates the stderr path instead is `rateLimit`: the CLI has to have
+ * reported capacity before its stderr is read as a cap. Misclassifying a crash
+ * as a cap is no longer the cheap mistake it was when a park merely cost one
+ * short wait — a park spends no execution attempt, so nothing scraps the card,
+ * and the ingress listener resumes the run unattended.
  */
 export function isRateLimited(
   payload: ClaudeResultPayload | null,
@@ -259,11 +283,27 @@ export function isRateLimited(
   if (payload === null && rateLimit !== undefined && rateLimit.windows.some((w) => w.utilization >= 1)) {
     return true;
   }
-  // Text is the LAST resort and only over the result field or a short stderr —
+  // Text is the LAST resort, and only over the result field or a short stderr —
   // never a transcript, which could contain the phrase incidentally in a tool
   // output or a file the agent happened to read.
-  const text = payload?.result ?? stderr.slice(0, 500);
-  return text.length > 0 && RATE_LIMIT_TEXT.test(text);
+  //
+  // The result field is the CLI's own statement of why it stopped, so any cap
+  // phrasing in it counts.
+  if (payload !== null) {
+    const result = payload.result ?? '';
+    return result.length > 0 && (RATE_LIMIT_TEXT_STRONG.test(result) || RATE_LIMIT_TEXT_WEAK.test(result));
+  }
+  // stderr is noisier: it now reaches this point on EVERY crash that produced
+  // no result event, which is most of them (the old gate skipped it whenever
+  // filtered stdout had anything at all — the issue #7 bug). Unambiguous
+  // phrasing still stands alone, so a CLI that reports the cap only on stderr
+  // parks rather than scraps. Ambiguous phrasing additionally needs the CLI to
+  // have reported capacity at all, which is what separates "the provider capped
+  // me" from "a command mentioning rate limits failed".
+  const text = stderr.slice(0, 500);
+  if (text.length === 0) return false;
+  if (RATE_LIMIT_TEXT_STRONG.test(text)) return true;
+  return rateLimit !== undefined && RATE_LIMIT_TEXT_WEAK.test(text);
 }
 
 /**

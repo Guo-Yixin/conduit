@@ -338,6 +338,16 @@ interface ChildExitContext {
   flow: FlowConfig;
 }
 
+/** Tell the channel a launch died — best effort, and never rejects on its caller. */
+async function fireSpawnFailedAlert(alert: AlertSeam, notice: SpawnFailedAlert): Promise<void> {
+  try {
+    await alert(notice);
+  } catch {
+    // Alerting is best effort once the ack is gone; the 'spawn_failed' log
+    // entry is the durable record.
+  }
+}
+
 /**
  * Supervise a launched child off the request path.
  *
@@ -390,15 +400,14 @@ async function watchChildExit(
       return;
     }
 
+    // Mark -> start alert -> log, and the alert is NOT awaited. A transport
+    // that never SETTLES (not merely one that throws) would otherwise block the
+    // durable ingress_log entry below AND the slot release in the finally,
+    // pinning a run slot for the life of the listener — at max_concurrent_runs
+    // 1, one hung post is a listener that never launches again, with nothing in
+    // the log to say why. Same rule as watchRedrivenChildExit and recordPark.
     db.markIngressFailed(eventId);
-
-    try {
-      await alert({ flowId, channel: alertChannel, eventId, reason });
-    } catch {
-      // Alerting is best effort once the ack is gone; the log entry below is
-      // the durable record of the failure.
-    }
-
+    void fireSpawnFailedAlert(alert, { flowId, channel: alertChannel, eventId, reason });
     db.appendIngressLog({ source, eventId, outcome: 'spawn_failed', reason });
   } catch {
     // Persistence itself failed (disk error on the state/journal db). Nothing

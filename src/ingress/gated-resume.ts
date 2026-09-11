@@ -60,7 +60,21 @@ export function startGatedResume(
   }
   if (acquisition === 'full' && !opts.bypassWhenSaturated) return { outcome: 'full' };
 
-  const done = resume().finally(() => {
+  // `resume()` is invoked inside the try, not just awaited: a closure that
+  // throws SYNCHRONOUSLY never produces a promise, so a bare
+  // `resume().finally(...)` would propagate past the release and strand the
+  // slot for the process lifetime (run slots are never persisted or reaped).
+  // The inline version this replaced used try/finally around `await resume()`,
+  // which covered that; keep the guarantee rather than relying on both callers
+  // happening to be `async`.
+  let running: Promise<void>;
+  try {
+    running = resume();
+  } catch (err) {
+    if (acquisition === 'acquired') slots.release(opts.slotId);
+    throw err;
+  }
+  const done = running.finally(() => {
     // A bypassed resume was never registered, so there is nothing to free.
     if (acquisition === 'acquired') slots.release(opts.slotId);
   });

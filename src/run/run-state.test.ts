@@ -357,11 +357,48 @@ describe('getRunState — cross-run isolation (AC-5)', () => {
 // reset is PARKED: nothing failed, and it is resumable once the gate opens.
 // ---------------------------------------------------------------------------
 
-/** Park a ready card behind a release gate (the executor's rate-limit park). */
+/**
+ * Park a ready card behind a release gate, the way the executor's rate-limit
+ * park does it: `release_at` stamped AND an `entered_lane` card_log entry
+ * classed 'rate_limited'. Both halves matter — the column alone cannot say why
+ * a card is gated, because the fan-out stagger stamps the very same column.
+ * See `staggerCard` below for the other writer.
+ */
 function parkCard(card: Card, releaseAt: number): void {
   db.getStateDb()
     .prepare("UPDATE cards SET status = 'ready', release_at = $at WHERE run_id = $r AND id = $id")
     .run({ $at: releaseAt, $r: card.run_id, $id: card.id });
+  db.appendCardLog({
+    runId: card.run_id,
+    kind: 'entered_lane',
+    cardId: card.id,
+    station: card.lane,
+    attempt: card.attempt,
+    sourceLane: card.lane,
+    destLane: card.lane,
+    reasonClass: 'rate_limited',
+  });
+}
+
+/**
+ * Gate a ready card the way the v10 fan-out cache-warming stagger does: the
+ * same `release_at` column, but a lane move that is ordinary forward progress.
+ * A run holding only these is scheduled, NOT parked behind a provider cap.
+ */
+function staggerCard(card: Card, releaseAt: number): void {
+  db.getStateDb()
+    .prepare("UPDATE cards SET status = 'ready', release_at = $at WHERE run_id = $r AND id = $id")
+    .run({ $at: releaseAt, $r: card.run_id, $id: card.id });
+  db.appendCardLog({
+    runId: card.run_id,
+    kind: 'entered_lane',
+    cardId: card.id,
+    station: card.lane,
+    attempt: card.attempt,
+    sourceLane: 'plan',
+    destLane: card.lane,
+    reasonClass: 'forward',
+  });
 }
 
 describe('getRunParkedRelease — the one predicate behind outcome=parked (issue #7)', () => {
@@ -474,6 +511,45 @@ describe('getRunParkedRelease — the one predicate behind outcome=parked (issue
       expect(getRunParkedRelease(db, 'r', NOW)).toBeNull();
     },
   );
+});
+
+describe('getRunParkedRelease — a gate is only a park when the card_log says so', () => {
+  const NOW = 1000;
+
+  it('is NOT parked when the only gate is a fan-out stagger, not a provider cap', () => {
+    // The halt that produced this shape was a budget blowout, and the operator
+    // has to see it as one: recording it 'parked' prints "parked behind a
+    // provider rate limit", suppresses the stuck-card summary, and hands the
+    // run to the ingress listener's unattended resume.
+    seedRun('r');
+    db.insertCard(makeCard('r', 'parent', { status: 'awaiting_children', lane: 'plan' }));
+    db.insertCard(makeCard('r', 'c1', { parent_id: 'parent' }));
+    db.insertCard(makeCard('r', 'c2', { parent_id: 'parent' }));
+    staggerCard(makeCard('r', 'c1', { parent_id: 'parent' }), NOW + 30);
+    staggerCard(makeCard('r', 'c2', { parent_id: 'parent' }), NOW + 60);
+    expect(getRunParkedRelease(db, 'r', NOW)).toBeNull();
+  });
+
+  it('names the soonest RATE-LIMITED gate, ignoring an earlier stagger gate', () => {
+    seedRun('r');
+    db.insertCard(makeCard('r', 'c1'));
+    db.insertCard(makeCard('r', 'c2'));
+    staggerCard(makeCard('r', 'c1'), NOW + 30);
+    parkCard(makeCard('r', 'c2'), NOW + 300);
+    // MIN(release_at) would say 1030 and resume the run while it is still
+    // capped; the cap is what the run is actually waiting on.
+    expect(getRunParkedRelease(db, 'r', NOW)).toEqual({ releaseAt: NOW + 300 });
+  });
+
+  it('reads the LATEST lane move — a card whose last move was forward is not parked', () => {
+    // card_log is UNIQUE(run_id, card_id, station, attempt, kind), so a second
+    // move for the same card must differ in attempt to be recorded at all.
+    seedRun('r');
+    db.insertCard(makeCard('r', 'c1'));
+    parkCard(makeCard('r', 'c1'), NOW + 300);
+    staggerCard(makeCard('r', 'c1', { attempt: 1 }), NOW + 300);
+    expect(getRunParkedRelease(db, 'r', NOW)).toBeNull();
+  });
 });
 
 describe('getRunState — parked (issue #7)', () => {

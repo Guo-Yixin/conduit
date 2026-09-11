@@ -1254,8 +1254,14 @@ async function cmdRun(argv: string[], deps: CliDeps): Promise<number> {
  * Resume runs in a FRESH process, so it first repairs what the dead one left
  * behind: orphaned in-flight workers are reclaimed to `interrupted`, and any
  * pending outbox intent is escalated to `hold` rather than blind-retried
- * (SPEC §5) — a human decides whether the effect landed. Then the engine runs,
- * and the exit code carries the same verdict as `cmdRun`.
+ * (SPEC §5) — a human decides whether the effect landed. Then the engine runs.
+ *
+ * Unlike `cmdRun`, the exit code is NOT the run's verdict: resume returns 0
+ * whenever it drove the engine at all, reserving non-zero for the reasons it
+ * could not start (an unknown run, a lease conflict, a bad flow). Callers that
+ * need the verdict read the `runs` row — which is what the ingress listener's
+ * parked-resume supervisor does, precisely because a halted or re-parked run
+ * still exits 0 here.
  */
 async function cmdResume(argv: string[], deps: CliDeps): Promise<number> {
   // Parse: resume [--rebind] [--run <id>] [--concurrency <n>] [--project-root <dir>] <flow.yaml>

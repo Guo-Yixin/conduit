@@ -1222,6 +1222,19 @@ describe('parked-run resume (issue #7)', () => {
     db.insertRun({ run_id: runId, flow: '/flows/a.yaml', input_fingerprint: 'fp', status: 'halted', outcome: 'parked' });
     db.insertCard({ run_id: runId, id: 'c1', parent_id: null, lane: 'narrate', status: 'ready', attempt: 0, wave: 0, owned_paths: [], rework_count: 0 });
     db.getStateDb().prepare('UPDATE cards SET release_at = $at WHERE run_id = $r').run({ $at: releaseAt, $r: runId });
+    // A real park also records WHY the card is gated: `release_at` alone cannot
+    // distinguish a provider cap from the fan-out cache-warming stagger, which
+    // stamps the same column.
+    db.appendCardLog({
+      runId,
+      kind: 'entered_lane',
+      cardId: 'c1',
+      station: 'narrate',
+      attempt: 0,
+      sourceLane: 'narrate',
+      destLane: 'narrate',
+      reasonClass: 'rate_limited',
+    });
     return runId;
   }
 

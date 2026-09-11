@@ -68,6 +68,19 @@ function parkRun(runId: string, releaseAt: number, cardId = 'c1'): void {
   db.getStateDb()
     .prepare('UPDATE cards SET release_at = $at WHERE run_id = $r AND id = $c')
     .run({ $at: releaseAt, $r: runId, $c: cardId });
+  // A real park also records WHY the card is gated: `release_at` alone cannot
+  // distinguish a provider cap from the fan-out cache-warming stagger, which
+  // stamps the same column.
+  db.appendCardLog({
+    runId,
+    kind: 'entered_lane',
+    cardId,
+    station: 'narrate',
+    attempt: 0,
+    sourceLane: 'narrate',
+    destLane: 'narrate',
+    reasonClass: 'rate_limited',
+  });
 }
 
 /** Drive `runId` to the completed terminal — cards at `done`, run row `complete`. */
@@ -330,6 +343,37 @@ describe('resumeDueParkedRuns', () => {
     expect(slots.inFlightCount()).toBe(0);
     await resumeDueParkedRuns(d);
     expect(resume.calls.map((c) => c.runId)).toEqual(['run-1', 'run-2']);
+  });
+
+  it('skips a run whose EVENT already has a launch in flight — never two drivers for one run', async () => {
+    // redriveOnBoot resolves on LAUNCH and marks the row 'spawned' before the
+    // parked sweep runs, so a row it just re-drove is immediately a resume
+    // candidate here. The re-drive sweep guards with the EVENT id while a
+    // resume registers `parked-resume:<runId>`, so that guard cannot see this
+    // one. Unguarded, the resume loses the run lease and exits 1 — and because
+    // its gate is in the past (that is why it was due) the run reads as neither
+    // complete nor parked, so a run that is succeeding collects a false
+    // 'did not complete' alert and a burned re-drive attempt.
+    seedIngressRun('e1', 'run-1');
+    parkRun('run-1', NOW_S - 10);
+    const slots = createRunSlots({ capacity: 4 });
+    // Stand in for the re-driven child: its launch holds the EVENT id.
+    expect(slots.tryAcquire('e1')).toBe('acquired');
+    const { deps: d, resume } = deps({ slots });
+
+    const report = await resumeDueParkedRuns(d);
+
+    expect(resume.calls).toHaveLength(0);
+    expect(report.resumed).toEqual([]);
+    expect(report.deferred).toEqual(['run-1']);
+    // Deferred, not failed: the row keeps its state and spends no attempt.
+    expect(db.getIngressEvent('e1')).toMatchObject({ spawn_state: 'spawned', spawn_attempts: 1 });
+    expect(db.getIngressLog({ outcome: 'spawn_failed' })).toHaveLength(0);
+
+    // Once that child is done, the next sweep resumes normally.
+    slots.release('e1');
+    await resumeDueParkedRuns(d);
+    expect(resume.calls.map((c) => c.runId)).toEqual(['run-1']);
   });
 
   it('suppresses a second resume of a run whose resume is already in flight', async () => {

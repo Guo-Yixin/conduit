@@ -642,12 +642,34 @@ describe('isRateLimited', () => {
     expect(isRateLimited(null, { status: 'blocked', windows: [] }, '')).toBe(true);
   });
 
+  it('does NOT read a bare 429 out of a stack trace line number', () => {
+    // ':429:' supplies word boundaries on both sides, so a bare \\b429\\b used to
+    // classify any crash whose first 500 bytes reached line 429 as a cap — and
+    // a cap spends no execution attempt, so nothing would ever scrap the card.
+    expect(isRateLimited(null, undefined, 'TypeError: x is not a function\n    at f (/app/lib/index.js:429:15)')).toBe(
+      false,
+    );
+  });
+
+  it('does NOT take the agent\'s own echoed command as a cap, absent any capacity reading', () => {
+    // stderr reaches the text path on every result-less crash now, so ambiguous
+    // phrasing needs the CLI to have reported capacity before it is believed.
+    const echoed = 'Error: command failed: grep -n "rate limit" README.md';
+    expect(isRateLimited(null, undefined, echoed)).toBe(false);
+    expect(isRateLimited(null, { windows: [{ utilization: 0.4 }] } as never, echoed)).toBe(true);
+  });
+
+  it('does NOT classify an ordinary crash with no cap phrasing at all', () => {
+    expect(isRateLimited(null, undefined, 'Segmentation fault (core dumped)')).toBe(false);
+  });
+
   it('falls back to the result text when nothing structured says so', () => {
     expect(isRateLimited({ result: "You've hit your session limit" }, undefined, '')).toBe(true);
   });
 
-  it('reads stderr text whenever there is no result payload — a warning event is no reason not to', () => {
+  it('reads UNAMBIGUOUS stderr text with no result payload — a warning event is no reason not to', () => {
     expect(isRateLimited(null, undefined, 'Error: 429 Too Many Requests')).toBe(true);
+    expect(isRateLimited(null, undefined, "You've hit your session limit")).toBe(true);
     // Issue #7: the CLI had emitted an allowed_warning event (stdout non-empty
     // once filtered) and then died on the cap with no result event. The old
     // classifier consulted stderr only when stdout was empty, so the one line

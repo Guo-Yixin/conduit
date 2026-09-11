@@ -98,10 +98,26 @@ export interface ParkNotice {
 
 /**
  * Record a park: an ingress_log 'parked' entry EVERY time, the alert ONCE per
- * event. "Once" is keyed on the log itself, so it survives a listener restart
- * and needs no state of its own. Informational — it never marks the event
- * failed, and a dead alert transport never throws past here. A caller with no
- * alert seam (a unit-level re-drive driver) just gets the log entry.
+ * event — for the life of the event, not per park sequence. "Once" is keyed on
+ * the log itself, so it survives a listener restart and needs no state of its
+ * own. Informational — it never marks the event failed, and a dead alert
+ * transport never throws past here. A caller with no alert seam (a unit-level
+ * re-drive driver) just gets the log entry.
+ *
+ * Per-event rather than per-sequence is deliberate, and it is the weaker of two
+ * bad options. The MAX park cap chunks one long reset into several
+ * resume/park cycles, and by the time a chunk re-parks the previous chunk's
+ * gate has always passed — so any "has the last gate expired?" rule re-alerts
+ * on every chunk, which is the noise this suppression exists to prevent.
+ * Nothing here can separate a chunk from a genuinely new cap without asking
+ * whether the run made progress in between.
+ *
+ * What keeps that from meaning "the operator is told once and then never
+ * again" is the kernel, not the listener: MAX_CONSECUTIVE_RATE_LIMIT_PARKS
+ * (controller/executor.ts) escalates a card that keeps parking without progress
+ * to `hold`. A held card is not parked, so the run stops being auto-resumed and
+ * its next exit takes the FAILURE path — mark, alert, log — which is the loud
+ * ending a cap that never clears is supposed to get.
  *
  * Resolves once the LOG is durable; the alert is started but not awaited, so a
  * transport that never settles cannot hold up the caller (see below).
@@ -216,6 +232,20 @@ export async function resumeDueParkedRuns(deps: ParkedResumeDeps): Promise<Parke
   const due = listDueParkedRuns(db, Math.floor(deps.now() / 1000));
 
   for (const [index, run] of due.entries()) {
+    // A launch for this EVENT may already be live in this process: redriveOnBoot
+    // resolves on launch and marks the row 'spawned' before afterSweep runs, so
+    // a row it just re-drove is immediately a resume candidate here. The
+    // re-drive sweep guards the same way (slots.tryAcquire(event_id) ->
+    // 'duplicate'), but it registers under the EVENT id while a resume
+    // registers under `parked-resume:<runId>`, so that guard cannot see this
+    // one. Without the check both drivers race: the resume loses the run lease,
+    // exits 1, and — its gate being in the past, which is why it was due —
+    // reads as neither complete nor parked, so a healthy run collects a false
+    // 'did not complete' alert and a burned re-drive attempt.
+    if (slots.inFlight(run.eventId)) {
+      report.deferred.push(run.runId);
+      continue;
+    }
     const started = startGatedResume(
       slots,
       db,
@@ -235,6 +265,11 @@ export async function resumeDueParkedRuns(deps: ParkedResumeDeps): Promise<Parke
       report.deferred.push(...due.slice(index).map((r) => r.runId));
       break;
     }
+    // Deliberately not awaited (the sweep is launch-only), so the rejection
+    // path has to be closed here rather than relying on superviseResume's own
+    // try/catch — a throw from slots.release would otherwise surface as an
+    // unhandled rejection with no caller left to see it.
+    started.done.catch(() => {});
     report.resumed.push(run.runId);
   }
   return report;
