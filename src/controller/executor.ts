@@ -3709,6 +3709,44 @@ async function executeHarnessStation(args: HarnessArgs): Promise<boolean> {
               ...rateLimitAttributes((invokeErr as { rateLimit?: RateLimitSnapshot }).rateLimit),
             },
           });
+          // WI-571 follow-up: an EFFECTFUL station cannot park through a cap.
+          // `pendingIntentKey !== null` means this dispatch already wrote a
+          // PENDING outbox intent before the invoke (the 'fire' path above) —
+          // the harness invocation itself is the billed/irreversible side
+          // effect (SPEC §5), same as a transform's model call or a
+          // deterministic station's command. A harness maker holds Read/
+          // Write/Bash for up to `timeoutMs` and can run for minutes before
+          // hitting a session cap, so 'harness-rate-limited' says only how
+          // the invocation ENDED, not whether its tool calls landed first —
+          // unlike the pure-station park below, where nothing was written to
+          // the outbox and no side effect could have occurred.
+          //
+          // Parking here would be a blind retry in disguise: a park spends no
+          // execution attempt, so the NEXT dispatch recomputes the identical
+          // idempotency key (`${flow.version}:${cardId}:${stationId}:${card.attempt}`)
+          // and reconcileOnResume can only ever answer 'escalate_hold' for a
+          // pending intent of unknown outcome — it never resolves it. So a
+          // parked effectful card would sit advertised as resumable (the
+          // whole point of a park, and what the ingress listener's unattended
+          // resume trusts) right up until the moment it is actually resumed,
+          // when it discovers the same unresolved intent and holds anyway —
+          // just later, after silently promising a working retry that could
+          // never succeed. Escalate directly instead, onto the terminal
+          // 'hold' lane, and leave the pending intent exactly as it is: we do
+          // not know whether the invocation's side effects landed, so
+          // discarding it would be the same guess in the other direction. A
+          // human resolves it.
+          if (pendingIntentKey !== null) {
+            escalateToHold(
+              stateDb, db, cardId, stationId, card,
+              `effectful harness station '${stationId}' hit a provider rate limit with a pending outbox ` +
+                `intent of unknown outcome (key: ${pendingIntentKey}); the invocation may have produced ` +
+                `irreversible side effects before the cap, so it cannot be safely retried or parked — ` +
+                `manual reconciliation required`,
+              err, runId, true,
+            );
+            return false;
+          }
           parkCardUntil(
             stateDb, db, cardId, stationId, card, releaseAt, runId,
             buildTransitionContext(stationId, flow, happyPathNext, terminalLanes, maxExecutionAttempts),

@@ -34,6 +34,7 @@ import {
 } from '../worker/harness-adapter';
 import { createClaudeHarnessAdapter } from '../worker/harness-adapter-claude';
 import type { HarnessSpawnResult } from '../worker/harness-runner';
+import { getRunParkedRelease } from '../run/run-state';
 
 // ---------------------------------------------------------------------------
 // Shared executor-test recipe.
@@ -132,7 +133,13 @@ const CRITIC_MODEL = 'critic-model';
 function writeHarnessFlow(
   dir: string,
   registry: HarnessRegistry,
-  opts: { maxAttempts?: number; wallClockMinutes?: number; harness?: string; gated?: boolean } = {},
+  opts: {
+    maxAttempts?: number;
+    wallClockMinutes?: number;
+    harness?: string;
+    gated?: boolean;
+    effectful?: boolean;
+  } = {},
 ): FlowConfig {
   const maxAttempts = opts.maxAttempts ?? 2;
   const wallClockMinutes = opts.wallClockMinutes ?? 10;
@@ -167,6 +174,7 @@ budgets:
 terminal_lanes: [done, scrap, hold]
 stations:
   - id: coder
+    effectful: ${opts.effectful ?? false}
     worker:
       kind: harness
       harness: ${harness}
@@ -703,6 +711,74 @@ describe('issue #16 review — an endless cap escalates instead of parking forev
     const card = getCard(db);
     expect(card?.lane).not.toBe('hold');
     expect(card?.lane).toBe('done');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// An effectful harness station cannot park through a cap: the invoke IS the
+// billed/irreversible side effect, so a pending outbox intent of unknown
+// outcome must escalate rather than resume at the same idempotency key.
+//
+// A wall-clock budget of EXACTLY zero (not HALT_AT_FIRST_GATE's 0.001
+// minutes) is deliberate here: the release-gate andon check runs on the
+// injected clock BEFORE any sleep, so with any nonzero budget elapsed==0
+// still clears it and the run loop takes one more internal tick — which, for
+// an effectful station, is enough for reconcileOnResume to self-correct the
+// dangling intent to 'hold' within the SAME process before ever halting.
+// That masks the bug this test is for: a real deployment's budget is minutes
+// or hours, so the run halts on the FIRST park, is reported 'parked', and
+// only a SEPARATE resumed process ever reaches the reconcile check. Zero
+// forces the halt at that same first park, so the test observes exactly the
+// state a real halt-then-resume would leave behind.
+// ---------------------------------------------------------------------------
+
+const HALT_ON_FIRST_PARK = { maxAttempts: 5, wallClockMinutes: 0 };
+
+describe('effectful harness station + rate limit — a pending intent cannot be parked through', () => {
+  it('holds the card instead of parking, and the run does not read as resumable', async () => {
+    db = openDb();
+    const { adapter } = makeScriptedHarness(rateLimited());
+    const registry = createHarnessRegistry([adapter]);
+    const flow = writeHarnessFlow(projectDir, registry, { ...HALT_ON_FIRST_PARK, effectful: true });
+    seedCoderCard(db);
+
+    await run(flow, registry);
+
+    const card = getCard(db);
+    // Not parked: parking would resume the card at the SAME idempotency key
+    // (flow.version:card:station:attempt, since a park spends no attempt),
+    // and reconcileOnResume can only ever answer 'escalate_hold' for a
+    // pending intent of unknown outcome — so parking here would just relabel
+    // this same hold one dispatch later, while advertising the run as
+    // resumable in between.
+    expect(card?.lane).toBe('hold');
+    expect(card?.status).toBe('held');
+    expect(releaseAtOf(db)).toBeNull();
+
+    const reasons = terminalReasons(db);
+    expect(reasons.some((r) => /outbox intent/.test(r) && /manual reconciliation/.test(r))).toBe(true);
+
+    // The run must not be reported 'parked' — that is what puts a run on the
+    // ingress listener's unattended resume path, and resuming here would
+    // dispatch straight back into the same escalate_hold.
+    expect(getRunParkedRelease(db, DEFAULT_RUN_ID, 100_000)).toBeNull();
+  });
+
+  it('still journals the rate-limit span even though it escalates instead of parking', async () => {
+    db = openDb();
+    const { adapter } = makeScriptedHarness(rateLimited());
+    const registry = createHarnessRegistry([adapter]);
+    const flow = writeHarnessFlow(projectDir, registry, { ...HALT_ON_FIRST_PARK, effectful: true });
+    seedCoderCard(db);
+
+    await run(flow, registry);
+
+    // The journal span is the record of what happened at the provider and is
+    // written the same way regardless of what the executor does next.
+    const spans = db.getJournalSpansForRun(DEFAULT_RUN_ID, 'entry');
+    const parked = spans.find((s) => s.name === 'coder.harness');
+    expect(parked?.usageUnknown).toBe(true);
+    expect(JSON.stringify(parked?.attributes)).toMatch(/harness-rate-limited/);
   });
 });
 

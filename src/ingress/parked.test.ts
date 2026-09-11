@@ -436,6 +436,46 @@ describe('resumeDueParkedRuns', () => {
     expect(d.slots.inFlightCount()).toBe(0);
   });
 
+  it('does not hold the run slot on a resume-failure alert that never settles', async () => {
+    // Mirrors recovery.test.ts's "does not hold the run slot on a park alert
+    // that never settles": the failure branch here awaited its alert until the
+    // #16 review flagged it, and at capacity 1 a stalled transport would pin
+    // `parked-resume:<runId>` for the life of the listener — no later parked
+    // run could ever resume, and the durable 'spawn_failed' log entry (written
+    // AFTER the alert in the old code) would never land either. A throwing
+    // seam already passes today (the try/catch swallows it); only a seam that
+    // never SETTLES proves the await itself is gone.
+    seedIngressRun('e1', 'run-1');
+    parkRun('run-1', NOW_S - 1);
+    const slots = createRunSlots({ capacity: 1 });
+    const neverSettling = { alert: () => new Promise<void>(() => {}), channels: {}, globalAlertChannel: '#ops' };
+    const resume = launchingResume();
+    const d = {
+      db,
+      slots,
+      resumeSpawn: resume.seam,
+      alerts: neverSettling,
+      now: () => NOW_MS,
+    };
+
+    await resumeDueParkedRuns(d);
+    // Neither complete nor re-parked: the failure branch.
+    scrapRun('run-1');
+    resume.finish('run-1', { ok: false, error: 'conduit resume exited with code 1' });
+
+    await Promise.race([
+      settle(),
+      new Promise((_, reject) =>
+        setTimeout(() => reject(new Error('superviseResume hung on a pending resume-failure alert')), 250),
+      ),
+    ]);
+
+    expect(db.getIngressEvent('e1')!.spawn_state).toBe('failed');
+    const [failed] = db.getIngressLog({ outcome: 'spawn_failed' });
+    expect(failed).toMatchObject({ eventId: 'e1', outcome: 'spawn_failed' });
+    expect(slots.inFlightCount()).toBe(0);
+  });
+
   it('after a resume that failed WITHOUT driving the run, the next sweep resumes nothing — no unbounded loop', async () => {
     seedIngressRun('e1', 'run-1');
     parkRun('run-1', NOW_S - 1);

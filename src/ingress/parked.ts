@@ -139,7 +139,7 @@ export async function recordPark(db: ConduitDB, alert: AlertSeam | undefined, no
   // throws) would otherwise pin that slot for the life of the listener and
   // defer every later launch. The ingress_log entry above is already durable,
   // so waiting for the send buys nothing.
-  void fireParkAlert(alert, {
+  void fireAlert(alert, {
     flowId,
     channel,
     eventId,
@@ -147,12 +147,19 @@ export async function recordPark(db: ConduitDB, alert: AlertSeam | undefined, no
   });
 }
 
-/** Tell the channel about a park — best effort, and never rejects on its caller. */
-async function fireParkAlert(alert: AlertSeam, notice: SpawnFailedAlert): Promise<void> {
+/**
+ * Send one channel alert — best effort, and never rejects on its caller.
+ *
+ * Both callers here (a park, and a resume that gave up) start this WITHOUT
+ * awaiting it, so the rejection has to be contained at the source or it becomes
+ * an unhandled rejection with no caller left to catch it. The durable record in
+ * either case is the ingress_log entry the caller writes, not the send.
+ */
+async function fireAlert(alert: AlertSeam, notice: SpawnFailedAlert): Promise<void> {
   try {
     await alert(notice);
   } catch {
-    // Best effort — the ingress_log 'parked' entry is the durable record.
+    // Best effort — the ingress_log entry is the durable record.
   }
 }
 
@@ -325,18 +332,21 @@ async function superviseResume(deps: ParkedResumeDeps, run: DueParkedRun): Promi
     const reason =
       `conduit resume of run '${runId}' did not complete: ` +
       (result.error ?? (result.ok ? 'the run halted' : 'unknown'));
+    // Mark -> start alert -> log, and the alert is NOT awaited — the same rule
+    // recordPark and the exit watchers follow (see recordPark's comment above
+    // for the never-settles-vs-throws distinction). At slot capacity 1, a
+    // stalled transport here would otherwise pin `parked-resume:<runId>`
+    // forever: startGatedResume's finalizer only releases the slot once this
+    // function returns, so no later parked run could ever resume, and the
+    // durable 'spawn_failed' log entry below would never land either.
     db.markIngressFailed(eventId);
     if (alerts !== undefined) {
-      try {
-        await alerts.alert({
-          flowId: flowId ?? UNATTRIBUTED_FLOW_ID,
-          channel: resolveAlertChannel(alerts, flowId),
-          eventId,
-          reason,
-        });
-      } catch {
-        // Best effort — the log entry below is the durable record.
-      }
+      void fireAlert(alerts.alert, {
+        flowId: flowId ?? UNATTRIBUTED_FLOW_ID,
+        channel: resolveAlertChannel(alerts, flowId),
+        eventId,
+        reason,
+      });
     }
     db.appendIngressLog({ source: PARKED_RESUME_SOURCE, eventId, outcome: 'spawn_failed', reason });
   } catch {
