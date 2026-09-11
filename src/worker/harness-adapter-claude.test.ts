@@ -125,6 +125,7 @@ function makeAdapter(
   });
 }
 
+/** A complete harness invocation; `over` names only the field under test. */
 function invocation(over: Partial<HarnessInvocation> = {}): HarnessInvocation {
   return {
     prompt: 'Implement the task described in task.md',
@@ -473,6 +474,69 @@ describe('claude-headless adapter: rate limits (issue #3)', () => {
   });
 });
 
+// ---------------------------------------------------------------------------
+// Issue #7 — the cap arrives AFTER a warning event, with no result event
+// ---------------------------------------------------------------------------
+
+/**
+ * The production shape from issue #7: the five-hour window at 0.99, the CLI
+ * emitted its `allowed_warning` rate_limit_event, then died on the cap WITHOUT
+ * a terminal result event. The stream filter keeps the warning line, so stdout
+ * is NON-empty — and the classifier's stderr fallback was gated on stdout being
+ * empty, so the only place the cap was named was never read.
+ */
+const RECORDED_WARNING_AT_0_99 = JSON.stringify({
+  type: 'rate_limit_event',
+  rate_limit_info: {
+    status: 'allowed_warning',
+    resetsAt: 1788328800,
+    rateLimitType: 'five_hour',
+    utilization: 0.99,
+    isUsingOverage: false,
+    surpassedThreshold: 0.75,
+  },
+});
+
+/** What the CLI prints on stderr when the cap stops it before any result event. */
+const CAP_STDERR = "You've hit your usage limit · resets 8pm (UTC)";
+
+describe('claude-headless adapter: a cap after a warning event, no result event (issue #7)', () => {
+  it('classifies the incident shape as rate-limited, not as a crash', async () => {
+    // Before this, the failure was 'harness-nonzero-exit': the executor burned
+    // max_execution_attempts on it in seconds and scrapped the card with
+    // attempt=0 — exactly the reported end state.
+    const adapter = makeAdapter({
+      run: makeRun({ stdout: RECORDED_WARNING_AT_0_99, exitCode: 1, stderr: CAP_STDERR }).run,
+    });
+
+    await expect(adapter.invoke(invocation())).rejects.toMatchObject({
+      code: 'harness-rate-limited',
+    });
+  });
+
+  it('parks on the reset the warning event reported, not the default interval', async () => {
+    const adapter = makeAdapter({
+      run: makeRun({ stdout: RECORDED_WARNING_AT_0_99, exitCode: 1, stderr: CAP_STDERR }).run,
+    });
+
+    await expect(adapter.invoke(invocation())).rejects.toMatchObject({
+      code: 'harness-rate-limited',
+      resetAtMs: 1788328800 * 1000,
+    });
+  });
+
+  it('still reports a crash when the warning event is followed by an unrelated stderr', async () => {
+    // The warning alone must not park: 0.99 is approaching the cap, not at it.
+    const adapter = makeAdapter({
+      run: makeRun({ stdout: RECORDED_WARNING_AT_0_99, exitCode: 1, stderr: 'segfault' }).run,
+    });
+
+    const err = await adapter.invoke(invocation()).catch((e: unknown) => e);
+    expect((err as { code?: string }).code).toBe('harness-nonzero-exit');
+    expect((err as Error).message).toMatch(/segfault/);
+  });
+});
+
 describe('parseClaudeStream / bindingResetAtMs', () => {
   it('takes the LAST result event and the LAST capacity reading', () => {
     const stdout = [
@@ -568,33 +632,89 @@ describe('parseClaudeStream / bindingResetAtMs', () => {
 
 describe('isRateLimited', () => {
   it('trusts the structured 429 first', () => {
-    expect(isRateLimited({ api_error_status: 429 }, undefined, '', '')).toBe(true);
+    expect(isRateLimited({ api_error_status: 429 }, undefined, '')).toBe(true);
   });
 
   it('parks when the CLI exits with NO result event but a blocked status', () => {
     // The scenario that would otherwise leave #3 open under the exact condition
     // it was filed for: no result event means api_error_status is unreadable,
     // and an untagged throw scraps the card.
-    expect(isRateLimited(null, { status: 'blocked', windows: [] }, '', '')).toBe(true);
+    expect(isRateLimited(null, { status: 'blocked', windows: [] }, '')).toBe(true);
+  });
+
+  it('does NOT read a bare 429 out of a stack trace line number', () => {
+    // ':429:' supplies word boundaries on both sides, so a bare \\b429\\b used to
+    // classify any crash whose first 500 bytes reached line 429 as a cap — and
+    // a cap spends no execution attempt, so nothing would ever scrap the card.
+    expect(isRateLimited(null, undefined, 'TypeError: x is not a function\n    at f (/app/lib/index.js:429:15)')).toBe(
+      false,
+    );
+  });
+
+  it('does NOT take a capacity snapshot as evidence of a cap on ambiguous stderr text', () => {
+    // The CLI emits rate_limit_event lines routinely, for ordinary capacity
+    // reporting, so a snapshot merely existing says nothing about whether the
+    // process actually died on a cap. Only unambiguous stderr phrasing is
+    // trusted now; a snapshot changes nothing about that.
+    const echoed = 'Error: command failed: grep -n "rate limit" README.md';
+    expect(isRateLimited(null, undefined, echoed)).toBe(false);
+    expect(isRateLimited(null, { windows: [{ utilization: 0.4 }] } as never, echoed)).toBe(false);
+  });
+
+  it('does NOT park on a near-full window plus ambiguous stderr text', () => {
+    // 0.99 is the exact shape of the allowed_warning reading from the original
+    // incident. Even a window that close to its ceiling is not licence to
+    // believe ambiguous phrasing: the stderr text still only mentions a rate
+    // limit incidentally (an echoed grep command), and the CLI never says so
+    // itself.
+    const echoed = 'Error: command failed: grep -n "rate limit" README.md';
+    const snapshot = { windows: [{ name: 'five_hour', utilization: 0.99, resetsAtMs: 1788328800_000 }] };
+    expect(isRateLimited(null, snapshot as never, echoed)).toBe(false);
+  });
+
+  it('does NOT classify an ordinary crash with no cap phrasing at all', () => {
+    expect(isRateLimited(null, undefined, 'Segmentation fault (core dumped)')).toBe(false);
   });
 
   it('falls back to the result text when nothing structured says so', () => {
-    expect(isRateLimited({ result: "You've hit your session limit" }, undefined, '', '')).toBe(true);
+    expect(isRateLimited({ result: "You've hit your session limit" }, undefined, '')).toBe(true);
   });
 
-  it('reads stderr text only when stdout produced nothing at all', () => {
-    expect(isRateLimited(null, undefined, '', 'Error: 429 Too Many Requests')).toBe(true);
-    // With stdout present, the transcript is NOT text-matched: an agent that
-    // merely read a file mentioning rate limits must not park the card.
-    expect(isRateLimited(null, undefined, '{"type":"assistant"}', 'rate limit')).toBe(false);
+  it('reads UNAMBIGUOUS stderr text with no result payload — a warning event is no reason not to', () => {
+    expect(isRateLimited(null, undefined, 'Error: 429 Too Many Requests')).toBe(true);
+    expect(isRateLimited(null, undefined, "You've hit your session limit")).toBe(true);
+    // Issue #7: the CLI had emitted an allowed_warning event (stdout non-empty
+    // once filtered) and then died on the cap with no result event. The old
+    // classifier consulted stderr only when stdout was empty, so the one line
+    // naming the cap was never read.
+    const snapshot = { status: 'allowed_warning', windows: [{ name: 'five_hour', utilization: 0.99, resetsAtMs: 1788328800_000 }] };
+    expect(isRateLimited(null, snapshot, "You've hit your usage limit · resets 8pm (UTC)")).toBe(true);
+  });
+
+  it('does NOT park on a warning event plus an unrelated stderr and no result', () => {
+    expect(isRateLimited(null, { status: 'allowed_warning', windows: [] }, 'segfault')).toBe(false);
+  });
+
+  it('parks when a captured window is fully consumed and no result event arrived', () => {
+    // utilization is the fraction of the window spent (RateLimitWindow); at
+    // 1.0 the cap IS reached, whatever `status` the CLI managed to attach
+    // before dying. Only without a result payload — a payload that exists and
+    // says something else keeps its say.
+    const full = { status: 'allowed_warning', windows: [{ name: 'five_hour', utilization: 1, resetsAtMs: 1788328800_000 }] };
+    expect(isRateLimited(null, full, '')).toBe(true);
+    expect(isRateLimited({ terminal_reason: 'refusal', result: 'nope' }, full, '')).toBe(false);
+  });
+
+  it('a result payload that names another cause is NOT overridden by stderr', () => {
+    expect(isRateLimited({ terminal_reason: 'refusal', result: 'nope' }, undefined, 'rate limit')).toBe(false);
   });
 
   it('does NOT park on allowed_warning — approaching a cap is not being stopped', () => {
-    expect(isRateLimited(null, { status: 'allowed_warning', windows: [] }, '', '')).toBe(false);
+    expect(isRateLimited(null, { status: 'allowed_warning', windows: [] }, '')).toBe(false);
   });
 
   it('does not park an ordinary crash', () => {
-    expect(isRateLimited({ terminal_reason: 'refusal', result: 'nope' }, undefined, '', 'segfault')).toBe(false);
+    expect(isRateLimited({ terminal_reason: 'refusal', result: 'nope' }, undefined, 'segfault')).toBe(false);
   });
 });
 

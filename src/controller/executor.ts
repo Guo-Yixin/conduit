@@ -69,7 +69,8 @@ import {
 import type { FlowGraph } from '../checkpoint/checkpoint';
 import { checkIntegrity } from '../worker/integrity';
 import type { IntegrityResult } from '../worker/integrity';
-import { checkConsumptionAndon, checkLiveness, planDrain } from '../control/watchdog';
+import { checkConsumptionAndon, checkLiveness, planDrain, type ConsumptionAndon } from '../control/watchdog';
+import { formatReleaseAt, soonestRateLimitGate } from '../run/run-state';
 import type { WorkerSlot } from '../control/watchdog';
 import { transition } from '../statemachine/transitions';
 import type { FsmState, TransitionContext } from '../statemachine/transitions';
@@ -147,6 +148,30 @@ const DEFAULT_RATE_LIMIT_PARK_SECONDS = 5 * 60;
  * budget it had already exhausted.
  */
 const MAX_RATE_LIMIT_PARK_SECONDS = 60 * 60;
+
+/**
+ * How many times in a row one card may park on a provider cap before the
+ * kernel stops waiting and asks a human.
+ *
+ * A park deliberately spends NO execution attempt (issue #3), which means none
+ * of the four rework guards (SPEC §6) bounds it: guard #1 skips a
+ * 'rate_limited' card_log entry by design, guard #2's counter is untouched,
+ * guard #3 has no findings hash to compare, and guard #4 halts the RUN — which
+ * the ingress listener now resumes unattended, with a fresh per-process budget.
+ * A station that fails in a way the classifier reads as a cap therefore parks,
+ * wakes, fails, and parks again forever, spending nothing and alerting once.
+ *
+ * So the parks themselves are counted. The threshold is deliberately generous:
+ * a real multi-hour cap is chunked into MAX_RATE_LIMIT_PARK_SECONDS pieces, so
+ * this is roughly half a day of honest waiting before the card hard-pauses to
+ * `hold` with a reason naming the repetition (SPEC: escalate ambiguity, never
+ * guess). Consecutive means consecutive: any invocation at the station that
+ * is not a cap — a success, a scrap, an integrity violation — resets the
+ * count, so a cap that clears and returns later starts over. The count
+ * includes the park being attempted, so the Nth consecutive cap holds the
+ * card instead of parking it.
+ */
+const MAX_CONSECUTIVE_RATE_LIMIT_PARKS = 12;
 
 /**
  * Convert a provider's absolute reset instant into a `cards.release_at` value.
@@ -890,7 +915,7 @@ export async function runExecutor(args: RunEngineArgs): Promise<void> {
         if (gateAndon.tripped) {
           if (!andonTripped) {
             andonTripped = true;
-            io.err(`andon: run halted — ${gateAndon.reason} budget exceeded`);
+            io.err(consumptionHaltMessage(gateAndon.reason, soonestRateLimitGate(db, runId, currentNow)));
           }
           halted = true;
           break;
@@ -1238,7 +1263,10 @@ export async function runExecutor(args: RunEngineArgs): Promise<void> {
     );
     if (consumptionAndon.tripped && !andonTripped) {
       andonTripped = true;
-      io.err(`andon: run halted — ${consumptionAndon.reason} budget exceeded`);
+      // This check follows the action batch, so it — not the release-gate
+      // wait — is what usually fires when a card has JUST re-parked past the
+      // budget. Both sites report through the same helper.
+      io.err(consumptionHaltMessage(consumptionAndon.reason, soonestRateLimitGate(db, runId, currentNow)));
 
       const { n: activeCountNow } = stateDb
         .prepare('SELECT COUNT(*) AS n FROM active_workers WHERE run_id = $runId')
@@ -3681,6 +3709,44 @@ async function executeHarnessStation(args: HarnessArgs): Promise<boolean> {
               ...rateLimitAttributes((invokeErr as { rateLimit?: RateLimitSnapshot }).rateLimit),
             },
           });
+          // WI-571 follow-up: an EFFECTFUL station cannot park through a cap.
+          // `pendingIntentKey !== null` means this dispatch already wrote a
+          // PENDING outbox intent before the invoke (the 'fire' path above) —
+          // the harness invocation itself is the billed/irreversible side
+          // effect (SPEC §5), same as a transform's model call or a
+          // deterministic station's command. A harness maker holds Read/
+          // Write/Bash for up to `timeoutMs` and can run for minutes before
+          // hitting a session cap, so 'harness-rate-limited' says only how
+          // the invocation ENDED, not whether its tool calls landed first —
+          // unlike the pure-station park below, where nothing was written to
+          // the outbox and no side effect could have occurred.
+          //
+          // Parking here would be a blind retry in disguise: a park spends no
+          // execution attempt, so the NEXT dispatch recomputes the identical
+          // idempotency key (`${flow.version}:${cardId}:${stationId}:${card.attempt}`)
+          // and reconcileOnResume can only ever answer 'escalate_hold' for a
+          // pending intent of unknown outcome — it never resolves it. So a
+          // parked effectful card would sit advertised as resumable (the
+          // whole point of a park, and what the ingress listener's unattended
+          // resume trusts) right up until the moment it is actually resumed,
+          // when it discovers the same unresolved intent and holds anyway —
+          // just later, after silently promising a working retry that could
+          // never succeed. Escalate directly instead, onto the terminal
+          // 'hold' lane, and leave the pending intent exactly as it is: we do
+          // not know whether the invocation's side effects landed, so
+          // discarding it would be the same guess in the other direction. A
+          // human resolves it.
+          if (pendingIntentKey !== null) {
+            escalateToHold(
+              stateDb, db, cardId, stationId, card,
+              `effectful harness station '${stationId}' hit a provider rate limit with a pending outbox ` +
+                `intent of unknown outcome (key: ${pendingIntentKey}); the invocation may have produced ` +
+                `irreversible side effects before the cap, so it cannot be safely retried or parked — ` +
+                `manual reconciliation required`,
+              err, runId, true,
+            );
+            return false;
+          }
           parkCardUntil(
             stateDb, db, cardId, stationId, card, releaseAt, runId,
             buildTransitionContext(stationId, flow, happyPathNext, terminalLanes, maxExecutionAttempts),
@@ -4386,6 +4452,39 @@ function escalateToHold(
 }
 
 /**
+ * How many provider-cap parks this card has taken in a row at `stationId`,
+ * INCLUDING the one being taken now.
+ *
+ * Counted from the JOURNAL, not the card_log, and that choice is load-bearing:
+ * card_log carries `UNIQUE(run_id, card_id, station, attempt, kind)` and is
+ * written with INSERT OR IGNORE, while a park deliberately leaves `attempt`
+ * alone — so every park after the first at a given station collapses into the
+ * first one's row and a card_log-based counter would read 1 forever. The
+ * journal is append-only and every harness outcome writes a
+ * `<station>.harness` span carrying an `outcome` attribute, so trailing
+ * 'harness-rate-limited' spans are exactly the consecutive parks: a success, a
+ * scrap reason, or an integrity violation all write their own span and break
+ * the streak.
+ */
+function countConsecutiveRateLimitParks(
+  db: ConduitDB,
+  runId: string,
+  cardId: string,
+  stationId: string,
+): number {
+  const spans = db.getJournalSpansForRun(runId, cardId);
+  const spanName = `${stationId}.harness`;
+  let streak = 0;
+  for (let i = spans.length - 1; i >= 0; i--) {
+    const span = spans[i]!;
+    if (span.name !== spanName) continue;
+    if (span.attributes.outcome !== 'harness-rate-limited') break;
+    streak++;
+  }
+  return streak;
+}
+
+/**
  * Park a rate-limited card until `releaseAtSeconds`, spending no attempt (issue #3).
  *
  * `releaseAtSeconds` is in the INJECTED clock's frame — see releaseAtForRateLimit.
@@ -4412,6 +4511,27 @@ function parkCardUntil(
   detail: string,
   err: (msg: string) => void,
 ): void {
+  // Nothing else bounds a park (see MAX_CONSECUTIVE_RATE_LIMIT_PARKS), so the
+  // repetition is what escalates. Checked BEFORE the move, so the cap counts
+  // the parks already survived rather than the one being made.
+  const parks = countConsecutiveRateLimitParks(db, runId, cardId, stationId);
+  if (parks >= MAX_CONSECUTIVE_RATE_LIMIT_PARKS) {
+    escalateToHold(
+      stateDb, db, cardId, stationId, card,
+      `card '${cardId}' has hit a provider rate limit ${parks} times in a row at '${stationId}' ` +
+        `without making progress — the cap is not clearing, or the failure is being misreported ` +
+        `as one. Held rather than parked again. Last detail: ${detail}`,
+      err, runId,
+      // Onto the 'hold' TERMINAL lane, not merely a held status at the station
+      // (the harness path's convention). A card left held at its own lane is
+      // still `lane != 'done'` with a live gate, which is exactly the shape
+      // getRunParkedRelease reads as parked — the run would be recorded
+      // 'parked' again and the listener would resume it into the same wall.
+      true,
+    );
+    return;
+  }
+
   const fsmResult = transition(
     {
       lane: card.lane,
@@ -4458,6 +4578,21 @@ function parkCardUntil(
   err(
     `rate limited: card ${cardId} parked at '${stationId}' until release_at=` +
       `${releaseAtSeconds} (no attempt consumed) — ${detail}`,
+  );
+}
+
+/**
+ * The consumption andon's halt line. A run halted while parked behind a
+ * provider cap did not run away — it was told to wait and could not afford to
+ * (issue #7). The generic line read as a failure, and nothing named the time
+ * after which `conduit resume` would succeed.
+ */
+function consumptionHaltMessage(reason: ConsumptionAndon['reason'], rateLimitReleaseAt: number | null): string {
+  if (rateLimitReleaseAt === null) return `andon: run halted — ${reason} budget exceeded`;
+  return (
+    `andon: run halted — ${reason} budget exceeded while parked behind a provider rate limit; ` +
+    `soonest release_at=${rateLimitReleaseAt} (${formatReleaseAt(rateLimitReleaseAt)}) — ` +
+    `cards are untouched and the run is resumable after that time`
   );
 }
 

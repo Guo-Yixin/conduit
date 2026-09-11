@@ -228,29 +228,93 @@ export function dominantModel(
  */
 const BLOCKED_RATE_LIMIT_STATUSES = new Set(['blocked', 'rejected', 'exhausted', 'rate_limited']);
 
-/** Phrasing the CLI uses when a subscription or session cap is what stopped it. */
-const RATE_LIMIT_TEXT = /rate limit|rate_limit|session limit|usage limit|too many requests|\b429\b/i;
+/**
+ * Phrasing that means a cap AND could not plausibly be saying anything else, so
+ * it is trusted on stderr on its own.
+ *
+ * A bare `429` is deliberately absent. It used to be here, and it matched any
+ * stack trace whose first 500 bytes reached line 429 — `.../index.js:429:15`
+ * supplies the word boundaries on both sides — classifying an ordinary crash as
+ * a provider cap. A status code only means a status code next to something that
+ * says it is one.
+ */
+const RATE_LIMIT_TEXT_STRONG =
+  /session limit|usage limit|too many requests|rate[ _]limit(?:ed|s)?[ _](?:exceeded|reached|hit)|rate_limit_error|\b(?:status|code|http)\s*:?\s*429\b/i;
+
+/**
+ * Phrasing that USUALLY means a cap but reads the same when something merely
+ * mentions one: an agent's own failed command echoed into stderr
+ * (`grep -n "rate limit" README.md`) is the shape that matters.
+ *
+ * Used against the result payload's `result` field only, never against stderr:
+ * the result field is the CLI's own statement of why it stopped, so ambiguous
+ * phrasing there is still the CLI talking about itself rather than text the
+ * process happened to emit. See isRateLimited for why stderr gets no such
+ * benefit of the doubt.
+ */
+const RATE_LIMIT_TEXT_WEAK = /rate limit|rate_limit/i;
 
 /**
  * Did this failed invocation fail because of a provider cap?
  *
  * Ordered most to least authoritative. The structured status is the only one
- * confirmed against a genuine cap; the other two exist so that a CLI which
+ * confirmed against a genuine cap; the others exist so that a CLI which
  * reports the same condition differently still parks rather than scraps.
+ *
+ * Deliberately NOT given stdout. It is the FILTERED stream — only `result` and
+ * `rate_limit_event` lines survive the spawn's line filter — so there is
+ * nothing in it to text-match beyond what `payload` and `rateLimit` already
+ * carry, and its content says nothing about whether stderr should be read.
+ * Issue #7 was exactly that mistake: a kept `allowed_warning` event made
+ * stdout non-empty, the CLI then died on the cap without a result event, and
+ * the stderr line naming the cap was skipped because stdout "had something".
+ *
+ * Stderr is trusted only on RATE_LIMIT_TEXT_STRONG, and `rateLimit` does not
+ * gate it (see the comment at that branch). Misclassifying a crash as a cap is
+ * not the cheap mistake it was when a park merely cost one short wait: a park
+ * spends no execution attempt, so nothing scraps the card, and the ingress
+ * listener resumes the run unattended.
  */
 export function isRateLimited(
   payload: ClaudeResultPayload | null,
   rateLimit: RateLimitSnapshot | undefined,
-  stdout: string,
   stderr: string,
 ): boolean {
   if (payload?.api_error_status === 429) return true;
   if (rateLimit?.status !== undefined && BLOCKED_RATE_LIMIT_STATUSES.has(rateLimit.status)) return true;
-  // Text is the LAST resort and only over the result field or a short stderr —
-  // never the whole transcript, which could contain the phrase incidentally in
-  // a tool output or a file the agent happened to read.
-  const text = payload?.result ?? (stdout.length === 0 ? stderr.slice(0, 500) : '');
-  return text.length > 0 && RATE_LIMIT_TEXT.test(text);
+  // A window the last capacity reading shows fully consumed IS the cap, whatever
+  // status label was attached — but only when the CLI died without a result
+  // event. A result payload that exists and names another cause keeps its say.
+  if (payload === null && rateLimit !== undefined && rateLimit.windows.some((w) => w.utilization >= 1)) {
+    return true;
+  }
+  // Text is the LAST resort, and only over the result field or a short stderr —
+  // never a transcript, which could contain the phrase incidentally in a tool
+  // output or a file the agent happened to read.
+  //
+  // The result field is the CLI's own statement of why it stopped, so any cap
+  // phrasing in it counts.
+  if (payload !== null) {
+    const result = payload.result ?? '';
+    return result.length > 0 && (RATE_LIMIT_TEXT_STRONG.test(result) || RATE_LIMIT_TEXT_WEAK.test(result));
+  }
+  // stderr is noisier: it now reaches this point on EVERY crash that produced
+  // no result event, which is most of them (the old gate skipped it whenever
+  // filtered stdout had anything at all — the issue #7 bug). Only unambiguous
+  // phrasing is trusted here, so a CLI that reports the cap only on stderr
+  // still parks rather than scraps.
+  //
+  // RATE_LIMIT_TEXT_WEAK is deliberately NOT tried against stderr, not even
+  // behind a capacity snapshot. That gate was tried and it gated almost
+  // nothing: the CLI emits a `rate_limit_event` on essentially every call as
+  // ordinary capacity reporting, so `rateLimit !== undefined` was true in the
+  // common case whether or not the process died on a cap. A harness crash that
+  // merely echoes the phrase (an agent's own failed
+  // `grep -n "rate limit" README.md`) then read the same as a real cap and
+  // parked instead of scrapping. Ambiguous text about something the CLI never
+  // claimed is still ambiguous, however little capacity was left.
+  const text = stderr.slice(0, 500);
+  return text.length > 0 && RATE_LIMIT_TEXT_STRONG.test(text);
 }
 
 /**
@@ -287,6 +351,7 @@ function fail(reason: string, code?: string, detail?: Record<string, unknown>): 
   );
 }
 
+/** Is the harness CLI on PATH? The detail is the resolved path, or why not. */
 async function defaultProbe(command: string): Promise<BinaryProbe> {
   const resolved = Bun.which(command);
   return resolved !== null
@@ -294,6 +359,11 @@ async function defaultProbe(command: string): Promise<BinaryProbe> {
     : { present: false, detail: `'${command}' not found on PATH` };
 }
 
+/**
+ * Build the `claude-headless` adapter: the Claude Code CLI wrapped as a harness
+ * station worker. Every collaborator (`command`, `run`, `probe`) is injectable
+ * so the tests can drive the adapter without spawning a real binary.
+ */
 export function createClaudeHarnessAdapter(config: ClaudeHarnessAdapterConfig): HarnessAdapter {
   const command = config.command ?? 'claude';
   const run = config.run ?? runHarnessProcess;
@@ -367,7 +437,7 @@ export function createClaudeHarnessAdapter(config: ClaudeHarnessAdapterConfig): 
         // scrap — leaving issue #3 open under the exact condition it was filed
         // for. Degrading into a park is the safe direction: the worst case is
         // one short wait before the card runs again.
-        if (isRateLimited(payload, rateLimit, spawnResult.stdout, spawnResult.stderr)) {
+        if (isRateLimited(payload, rateLimit, spawnResult.stderr)) {
           const resetAtMs = bindingResetAtMs(rateLimit);
           fail(
             `provider rate limit: ${payload?.result ?? rateLimit?.status ?? 'no detail reported'}`,
