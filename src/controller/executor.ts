@@ -3674,6 +3674,7 @@ async function executeHarnessStation(args: HarnessArgs): Promise<boolean> {
           tools: stationConfig.tools ?? [],
           timeoutMs,
           model: effectiveModel,
+          onProgress: stampHarnessActivity,
         });
       } catch (invokeErr) {
         // WI-567 FR-8 fix: stamp fresh liveness progress even on a thrown

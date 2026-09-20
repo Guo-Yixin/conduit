@@ -44,6 +44,8 @@ export interface HarnessInvocation {
    * default, FR-10).
    */
   model?: string;
+  /** Called as the underlying harness emits stdout progress. */
+  onProgress?: () => void;
 }
 
 /** A reference to one output the harness produced (name + path, not bytes). */
