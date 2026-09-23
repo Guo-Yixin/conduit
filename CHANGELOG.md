@@ -33,10 +33,6 @@ historical context, not public releases or public repository history.
 
 ### Fixed
 
-- Harness liveness now refreshes for every streamed stdout line during a
-  Claude invocation, including transcript lines discarded by the result
-  filter ([#31](https://github.com/theaiteam-dev/conduit/issues/31)).
-
 - A provider rate limit no longer destroys a run
   ([#3](https://github.com/theaiteam-dev/conduit/issues/3)). A 429 was
   indistinguishable from a crash — both surfaced as `harness-nonzero-exit`,
