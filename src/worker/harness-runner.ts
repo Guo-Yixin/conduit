@@ -7,12 +7,15 @@
  * (not a lone pid) on expiry, and confines the child's cwd to inside the
  * project root.
  *
- * Bun.spawn's native `timeout`/`killSignal` (used by runDeterministic in
- * ./deterministic.ts) kills only the immediate child — a grandchild the
- * harness backgrounds (a common agent-CLI pattern) reparents to init and
- * survives. This runner instead spawns the child DETACHED (`setsid()`, so
- * the child's pid becomes its own process-group id) and, on timeout, sends
- * SIGKILL to the negative pid — the whole group, grandchildren included.
+ * Bun.spawn's native `timeout`/`killSignal` kills only the immediate child: a
+ * grandchild the harness backgrounds (a common agent-CLI pattern) reparents to
+ * init and survives. This runner instead spawns the child DETACHED (`setsid()`,
+ * so the child's pid becomes its own process-group id) and sends SIGKILL to the
+ * negative pid, which is the whole group, grandchildren included
+ * (`killProcessGroup` in ./process-group.ts, shared with runDeterministic):
+ * on timeout, AND again once the harness leader has exited on its own (#17):
+ * a backgrounded grandchild that inherited the stdout/stderr pipes would
+ * otherwise keep them open and stall the drains until the timeout fires.
  *
  * Do NOT apply a command allowlist here — the harness binary comes from
  * trusted engine config (WI-560); the `tools` allowlist is enforced
@@ -22,6 +25,7 @@
 
 import { resolve, sep } from 'node:path';
 import { existsSync, statSync } from 'node:fs';
+import { killProcessGroup, trackProcessGroup, untrackProcessGroup } from './process-group';
 
 /** The command + argv to spawn (no shell — array form, per the Law-lite pattern). */
 export interface HarnessCommand {
@@ -153,9 +157,13 @@ function resolveConfinedCwd(projectRoot: string, cwd: string | undefined): strin
 }
 
 /**
- * Spawn `cmd` bounded by `config.timeoutMs`. On timeout, SIGKILLs the whole
- * process group (setsid-detached child) so backgrounded grandchildren are
- * reaped too, and resolves with `timedOut: true` rather than a normal exit.
+ * Spawn `cmd` bounded by `config.timeoutMs`. SIGKILLs the whole process group
+ * (setsid-detached child) after the leader exits, on EVERY exit path, not only
+ * on timeout (#17): a harness that finishes on its own but left a grandchild
+ * backgrounded is reaped just the same, before the output drains are awaited,
+ * so that grandchild cannot stall the runner until timeoutMs by holding the
+ * inherited stdout/stderr pipes open. Only a genuine timeout resolves with
+ * `timedOut: true`; a post-exit kill never marks a normal exit as one.
  */
 export async function runHarnessProcess(
   cmd: HarnessCommand,
@@ -175,29 +183,48 @@ export async function runHarnessProcess(
     // Never inherit the parent env wholesale — only the allowlisted names.
     env: childEnv,
   });
+  // The detached group no longer receives the terminal's Ctrl-C, so register
+  // it for the kernel's signal and exit handlers (./process-group.ts).
+  trackProcessGroup(proc.pid);
 
   const timer = setTimeout(() => {
-    try {
-      // Negative pid == the process GROUP, not just the immediate child.
-      process.kill(-proc.pid, 'SIGKILL');
-    } catch {
-      /* group already exited — nothing to kill */
-    }
+    killProcessGroup(proc.pid);
   }, config.timeoutMs);
 
-  const [exitCode, stdout, stderr] = await Promise.all([
-    proc.exited,
+  // Start draining now so a harness that writes more than a pipe buffer is not
+  // blocked on a full pipe while we wait for it to exit.
+  const stdoutText =
     config.stdoutLineFilter !== undefined
       ? readKeptLines(proc.stdout as ReadableStream<Uint8Array>, config.stdoutLineFilter)
-      : new Response(proc.stdout).text(),
-    new Response(proc.stderr as ReadableStream).text(),
-  ]);
-  clearTimeout(timer);
+      : new Response(proc.stdout).text();
+  const stderrText = new Response(proc.stderr as ReadableStream).text();
+  // Attach a handler now: a throwing `stdoutLineFilter` rejects its drain while
+  // proc.exited is still pending, which would otherwise be an unhandled
+  // rejection. `await drains` below rethrows it after the group kill.
+  const drains = Promise.all([stdoutText, stderrText]);
+  drains.catch(() => {});
+
+  let exitCode: number;
+  try {
+    exitCode = await proc.exited;
+  } finally {
+    clearTimeout(timer);
+    // #17: the harness has exited, but a descendant it backgrounded may still
+    // be running and holding the pipes. Kill the group BEFORE awaiting the
+    // drains below so they settle. Bytes already written stay readable, so no
+    // output is lost. The leader has already exited, so this does not change
+    // its exit status or signalCode. While any member is alive the group id
+    // cannot be reused, so the signal reaches only this harness's descendants;
+    // an empty group is ESRCH.
+    killProcessGroup(proc.pid);
+    untrackProcessGroup(proc.pid);
+  }
+
+  const [stdout, stderr] = await drains;
 
   const durationMs = Date.now() - startedAt;
 
-  // Distinguish OUR timeout-kill from a normal exit (mirrors runDeterministic's
-  // discrimination in ./deterministic.ts). A shared flag set independently
+  // Distinguish OUR timeout-kill from a normal exit. A shared flag set independently
   // inside the setTimeout callback would race: when the child exits naturally
   // right around the deadline, the timer can still fire and attempt a kill —
   // harmless (it fails silently on an already-exited pid) but a flag set there
