@@ -15,9 +15,9 @@ import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import type { StationGateConfig } from '../types/kernel';
 import type { ModelAdapter } from '../worker/adapter';
-import type { HarnessRegistry } from '../worker/harness-adapter';
+import { resolveHarnessAgent, type HarnessRegistry } from '../worker/harness-adapter';
 import { DEFAULT_RUN_ID, type ConduitDB, type StoredCardLogEntry } from '../persistence/db';
-import { runGateCheck, runHarnessGateCheck, computeFindingsHash } from '../quality/gate';
+import { runGateCheck, runHarnessGateCheck, computeFindingsHash, type CriticUsage } from '../quality/gate';
 import { renderPrompt } from '../flow/render';
 
 /** Default wall-clock bound for an agentic (harness) critic invocation (WI-570). */
@@ -98,8 +98,8 @@ export interface GateReworkInput {
  * findings array; those branches are fail-closed, not missing-data.
  */
 export type GateReworkDecision =
-  | { action: 'pass'; verdict: 'pass'; findings: string[]; returnTo: null; attempt: number }
-  | { action: 'rework'; verdict: 'reject'; findings: string[]; returnTo: string; attempt: number }
+  | { action: 'pass'; verdict: 'pass'; findings: string[]; returnTo: null; attempt: number; criticUsage?: CriticUsage }
+  | { action: 'rework'; verdict: 'reject'; findings: string[]; returnTo: string; attempt: number; criticUsage?: CriticUsage }
   | {
       action: 'scrap';
       /**
@@ -115,6 +115,14 @@ export type GateReworkDecision =
       findings: string[];
       returnTo: null;
       attempt: number;
+      /**
+       * issue #26 AC3/AC5: carried even on the guard scraps (`rework_cap`,
+       * `no_progress`) that this module names itself, NOT just on a gate-check
+       * 'scrapped' verdict — a critic that rejected and was then scrapped by a
+       * guard here was still billed for that rejection, and the caller must
+       * still fold/journal it.
+       */
+      criticUsage?: CriticUsage;
     };
 
 // ---------------------------------------------------------------------------
@@ -193,6 +201,35 @@ export async function runGateRework(input: GateReworkInput): Promise<GateReworkD
                 : resolved.error),
           );
         }
+        // issue #26 AC4 (FR-10): station-over-adapter precedence for the
+        // critic's model, mirroring the maker path's `effectiveModel =
+        // stationConfig.model ?? harnessAdapter.model` (executor.ts ~3495).
+        //
+        // The flow loader (flow/load.ts) sets an ABSENT critic model to the
+        // EMPTY STRING (`criticModel: chk.critic.model ?? ''`), never
+        // `undefined` — so `gateConfig.criticModel ?? resolved.adapter.model`
+        // would never fall through to the adapter default (`''` is not
+        // nullish). Resolve '' as absent explicitly instead.
+        const criticModel = gateConfig.criticModel !== '' ? gateConfig.criticModel : resolved.adapter.model;
+        // Issue #28: the critic's named agent, same precedence. The loader
+        // leaves an absent criticAgent absent (no '' sentinel), so `??` is
+        // correct here. Resolved before invoking so an agent without a
+        // definition file throws, which the executor turns into a hold, rather
+        // than running a critic the kernel cannot identify.
+        const criticAgent = gateConfig.criticAgent ?? resolved.adapter.agent;
+        // The definition hash rides to the journal's critic span on
+        // CriticUsage, so this is the only resolution. It is not folded into
+        // a binding stamp because a gate critic writes no checkpoint and is
+        // never skipped on resume: every attempt re-runs the critic against
+        // the current definition file.
+        let criticAgentSha256: string | undefined;
+        if (criticAgent !== undefined) {
+          const definition = resolveHarnessAgent(resolved.adapter, criticAgent);
+          if (!definition.ok) {
+            throw new Error(`harness critic agent unresolved for station '${workerStationId}': ${definition.error}`);
+          }
+          criticAgentSha256 = definition.sha256;
+        }
         return runHarnessGateCheck({
           cardId,
           station: workerStationId,
@@ -202,6 +239,8 @@ export async function runGateRework(input: GateReworkInput): Promise<GateReworkD
           criticInputScope: gateConfig.criticInputScope,
           projectRoot,
           timeoutMs: gateConfig.criticTimeoutMs ?? DEFAULT_HARNESS_CRITIC_TIMEOUT_MS,
+          model: criticModel,
+          ...(criticAgent !== undefined ? { agent: criticAgent, agentSha256: criticAgentSha256 } : {}),
           onReject: gateConfig.onReject,
           validBackEdges,
           tools: gateConfig.criticTools,
@@ -236,6 +275,7 @@ export async function runGateRework(input: GateReworkInput): Promise<GateReworkD
         findings: gateDecision.output.payload.findings,
         returnTo: null,
         attempt,
+        criticUsage: gateDecision.criticUsage,
       };
 
     case 'scrapped':
@@ -246,11 +286,11 @@ export async function runGateRework(input: GateReworkInput): Promise<GateReworkD
       // verdict-missing vs verdict-unparseable vs verdict-invalid all read
       // identically downstream), which is exactly what named the wrong suspect
       // during a model bisect.
-      return { action: 'scrap', reason: gateDecision.reason, verdict: 'reject', findings: [], returnTo: null, attempt };
+      return { action: 'scrap', reason: gateDecision.reason, verdict: 'reject', findings: [], returnTo: null, attempt, criticUsage: gateDecision.criticUsage };
 
     case 'invalid_verdict':
       // Critic returned an unresolvable return_to — no usable findings.
-      return { action: 'scrap', reason: 'invalid_verdict', verdict: 'reject', findings: [], returnTo: null, attempt };
+      return { action: 'scrap', reason: 'invalid_verdict', verdict: 'reject', findings: [], returnTo: null, attempt, criticUsage: gateDecision.criticUsage };
 
     case 'reject': {
       const findings = gateDecision.output.payload.findings;
@@ -267,7 +307,11 @@ export async function runGateRework(input: GateReworkInput): Promise<GateReworkD
         attempt,
       );
       if (priorVerdict !== null && computeFindingsHash(priorVerdict.findings) === currentHash) {
-        return { action: 'scrap', reason: 'no_progress', verdict: 'reject', findings, returnTo: null, attempt };
+        // issue #26 AC3/AC5: the critic that rejected (and was billed for it)
+        // is the SAME check that just tripped guard #3 — carry its usage even
+        // though this branch names its own 'no_progress' reason rather than
+        // propagating the gate check's.
+        return { action: 'scrap', reason: 'no_progress', verdict: 'reject', findings, returnTo: null, attempt, criticUsage: gateDecision.criticUsage };
       }
 
       // ── Guard #1: durable per-gate rework cap (SPEC §6 four-guard system) ───
@@ -280,14 +324,16 @@ export async function runGateRework(input: GateReworkInput): Promise<GateReworkD
           // scrapping.  The gate_verdict card_log entry (appended by the
           // executor BEFORE this switch) is the durable "findings attached"
           // record — no payload mutation is needed here.
-          return { action: 'rework', verdict: 'reject', findings, returnTo: gateDecision.returnTo, attempt };
+          return { action: 'rework', verdict: 'reject', findings, returnTo: gateDecision.returnTo, attempt, criticUsage: gateDecision.criticUsage };
         }
         // 'scrap' (default): the rejection that tripped the cap carries findings;
-        // preserve them so triage can read the final rejecting reason.
-        return { action: 'scrap', reason: 'rework_cap', verdict: 'reject', findings, returnTo: null, attempt };
+        // preserve them so triage can read the final rejecting reason. Same
+        // reasoning as the no_progress branch above: this rejection was billed
+        // and guard #1 (not the gate check) is what named the scrap reason.
+        return { action: 'scrap', reason: 'rework_cap', verdict: 'reject', findings, returnTo: null, attempt, criticUsage: gateDecision.criticUsage };
       }
 
-      return { action: 'rework', verdict: 'reject', findings, returnTo: gateDecision.returnTo, attempt };
+      return { action: 'rework', verdict: 'reject', findings, returnTo: gateDecision.returnTo, attempt, criticUsage: gateDecision.criticUsage };
     }
   }
 }

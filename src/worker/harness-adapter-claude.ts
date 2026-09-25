@@ -7,6 +7,11 @@
  * JSON usage/cost output (never scraped from free text), and translates the
  * station's declared `tools` allowlist into claude's `--allowed-tools` flag.
  *
+ * Issue #28: a station's named agent becomes `--agent`, and engine-config
+ * plugin dirs become one `--plugin-dir` each. Issue #29: with `isolateConfig`
+ * the child gets a run-scoped CLAUDE_CONFIG_DIR instead of the operator's
+ * ~/.claude (claude-config-isolation.ts).
+ *
  * `outputs` is always `[]` — the executor collects declared outputs from disk
  * (findMissingDeclaredOutputs in executor.ts); the claude JSON payload carries
  * no file manifest, so this adapter never fabricates output references.
@@ -14,11 +19,15 @@
  * Do NOT touch ./harness.ts (unrelated worker-pool subprocess harness).
  */
 
+import { isAbsolute } from 'node:path';
+import { statSync } from 'node:fs';
 import type {
   HarnessAdapter, HarnessInvocation, HarnessResult, BinaryProbe,
-  RateLimitSnapshot, RateLimitWindow,
+  RateLimitSnapshot, RateLimitWindow, KnownUsage,
 } from './harness-adapter';
 import { runHarnessProcess } from './harness-runner';
+import { resolveClaudePluginAgent } from './claude-plugin-agents';
+import { createRunScopedClaudeConfigDir, removeRunScopedClaudeConfigDir } from './claude-config-isolation';
 import type { HarnessCommand, HarnessRunnerConfig, HarnessSpawnResult } from './harness-runner';
 
 export interface ClaudeHarnessAdapterConfig {
@@ -30,6 +39,26 @@ export interface ClaudeHarnessAdapterConfig {
   command?: string;
   /** Optional --model override. */
   model?: string;
+  /** Default --agent (issue #28). A station's own agent wins. */
+  agent?: string;
+  /**
+   * Absolute plugin directories, one --plugin-dir each (issue #28). Each must
+   * be an existing directory: the CLI ignores a missing one without error, and
+   * the kernel must be able to read agent definitions out of it.
+   */
+  pluginDirs?: string[];
+  /**
+   * Point the child at a run-scoped CLAUDE_CONFIG_DIR holding only a link to
+   * the operator's credentials, and pass --strict-mcp-config (issue #29).
+   * Off by default, which keeps the child reading the operator's config.
+   */
+  isolateConfig?: boolean;
+  /**
+   * Kernel env used to find the operator's credentials under isolateConfig and
+   * to resolve the env allowlist. Injected for testability; defaults to
+   * process.env.
+   */
+  sourceEnv?: Record<string, string | undefined>;
   /** Injected process-runner seam, for testability. Defaults to runHarnessProcess. */
   run?: (cmd: HarnessCommand, config: HarnessRunnerConfig) => Promise<HarnessSpawnResult>;
   /** Injected binary-presence probe, for testability. Defaults to a real PATH check. */
@@ -222,6 +251,66 @@ export function dominantModel(
 }
 
 /**
+ * Build the structured `KnownUsage` object from a parsed result payload, or
+ * undefined when the payload cannot support one (issue #26 AC5).
+ *
+ * ONE construction, shared by the success path and by the two throw sites
+ * that can still recover a genuine figure (`harness-rate-limited`,
+ * `harness-nonzero-exit`) — so the shape can never drift between "this call
+ * succeeded" and "this call failed but was billed". Returning undefined here
+ * must NOT be read as "usage is unknown, but the call still resolves" on the
+ * success path: the caller there still `fail()`s on a missing/malformed usage
+ * object, exactly as before this helper existed.
+ */
+function buildKnownUsage(
+  payload: ClaudeResultPayload | null,
+  rateLimit: RateLimitSnapshot | undefined,
+): KnownUsage | undefined {
+  if (payload === null) return undefined;
+  if (typeof payload.usage !== 'object' || payload.usage === null || Array.isArray(payload.usage)) {
+    return undefined;
+  }
+  if (typeof payload.total_cost_usd !== 'number') return undefined;
+
+  const usage = payload.usage;
+  // Still the TRUE TOTAL across all four classes: run and wave budgets fold
+  // this number, so it must not shrink to input+output when the breakdown
+  // below splits it out. (These four are disjoint in claude's schema —
+  // input_tokens is uncached input, not an inclusive total — so summing
+  // them double-counts nothing.)
+  const tokens =
+    (usage.input_tokens ?? 0) +
+    (usage.output_tokens ?? 0) +
+    (usage.cache_creation_input_tokens ?? 0) +
+    (usage.cache_read_input_tokens ?? 0);
+
+  // modelUsage names the models the provider actually billed, filling the
+  // journal's `model` column (empty on harness rows until now).
+  //
+  // TWO OR MORE entries is the NORMAL case, not the exception: Claude Code
+  // bills a haiku model for side tasks alongside the main model, so even a
+  // trivial call returns two. Requiring exactly one meant the column fell
+  // back to the station's requested model on essentially every row —
+  // delivering nothing #5 asked for. Attribute to the entry that consumed
+  // the most tokens instead: that is the model that did the work and drove
+  // the cost.
+  const billedModel = dominantModel(payload.modelUsage);
+
+  return {
+    tokens,
+    cost: payload.total_cost_usd,
+    breakdown: {
+      inputTokens: usage.input_tokens ?? 0,
+      outputTokens: usage.output_tokens ?? 0,
+      cacheReadInputTokens: usage.cache_read_input_tokens ?? 0,
+      cacheCreationInputTokens: usage.cache_creation_input_tokens ?? 0,
+    },
+    ...(billedModel !== undefined ? { model: billedModel } : {}),
+    ...(rateLimit !== undefined ? { rateLimit } : {}),
+  };
+}
+
+/**
  * Blocking rate-limit states. `allowed_warning` is NOT one of them — it means
  * approaching a ceiling, not stopped at it, and treating it as a cap would park
  * cards that could still run.
@@ -351,6 +440,31 @@ function fail(reason: string, code?: string, detail?: Record<string, unknown>): 
   );
 }
 
+/**
+ * Reject a plugin dir the kernel cannot use, at construction (engine boot).
+ * `claude --plugin-dir` also accepts a .zip, but a zip cannot be scanned for
+ * agent definitions without unpacking it, so only directories are accepted.
+ */
+function assertUsablePluginDirs(pluginDirs: readonly string[]): void {
+  for (const dir of pluginDirs) {
+    if (!isAbsolute(dir)) {
+      throw new Error(`claude-headless: plugin dir '${dir}' is not an absolute path`);
+    }
+    let isDir = false;
+    try {
+      isDir = statSync(dir).isDirectory();
+    } catch {
+      throw new Error(`claude-headless: plugin dir '${dir}' does not exist`);
+    }
+    if (!isDir) {
+      throw new Error(
+        `claude-headless: plugin dir '${dir}' is not a directory (a .zip plugin must be unpacked so its ` +
+          `agent definitions can be hashed)`,
+      );
+    }
+  }
+}
+
 /** Is the harness CLI on PATH? The detail is the resolved path, or why not. */
 async function defaultProbe(command: string): Promise<BinaryProbe> {
   const resolved = Bun.which(command);
@@ -368,12 +482,20 @@ export function createClaudeHarnessAdapter(config: ClaudeHarnessAdapterConfig): 
   const command = config.command ?? 'claude';
   const run = config.run ?? runHarnessProcess;
   const probe = config.probe ?? (() => defaultProbe(command));
+  const pluginDirs = config.pluginDirs ?? [];
+  assertUsablePluginDirs(pluginDirs);
+  const sourceEnv = config.sourceEnv ?? process.env;
 
   return {
     name: 'claude-headless',
     reportsUsage: true,
     canRestrictTools: true,
     model: config.model,
+    agent: config.agent,
+
+    resolveAgentDefinition(agent: string) {
+      return resolveClaudePluginAgent(pluginDirs, agent);
+    },
 
     async probeBinary(): Promise<BinaryProbe> {
       return probe();
@@ -390,6 +512,24 @@ export function createClaudeHarnessAdapter(config: ClaudeHarnessAdapterConfig): 
       if (model !== undefined) {
         args.push('--model', model);
       }
+      // Station wins over the adapter's configured default, as for --model.
+      // An agent the CLI does not know exits 1 naming it (verified against
+      // claude 2.1.282), which the nonzero-exit path below reports.
+      const agent = call.agent ?? config.agent;
+      if (agent !== undefined) {
+        args.push('--agent', agent);
+      }
+      // A --plugin-dir plugin takes precedence over an installed plugin of the
+      // same name, so its agents are the ones --agent resolves to.
+      for (const dir of pluginDirs) {
+        args.push('--plugin-dir', dir);
+      }
+      // The run-scoped config dir fences user-level MCP config; this also drops
+      // the account's claude.ai connectors, which the CLI loads regardless of
+      // the config dir.
+      if (config.isolateConfig === true) {
+        args.push('--strict-mcp-config');
+      }
       // Comma-joined single value — claude accepts comma- or space-separated.
       // Empty tools (the executor's encoding of a waived unrestricted_tools:
       // true station) passes through with NO narrowing flag.
@@ -400,21 +540,37 @@ export function createClaudeHarnessAdapter(config: ClaudeHarnessAdapterConfig): 
       // swallow the prompt positional.
       args.push('--', call.prompt);
 
-      const spawnResult = await run(
-        { command, args },
-        {
-          projectRoot: config.projectRoot,
-          timeoutMs: call.timeoutMs,
-          envAllowlist: config.envAllowlist,
-          // stream-json carries the whole agent transcript; we need two events
-          // from it. Filtering as it arrives keeps a long station's memory
-          // proportional to what we actually read, not to how much it did.
-          stdoutLineFilter: (line) => CLAUDE_KEPT_EVENT.test(line),
-          onStdoutLine: () => call.onProgress?.(),
-        },
-      );
+      // Throws before anything is spawned when the child could not authenticate.
+      const configDir =
+        config.isolateConfig === true ? createRunScopedClaudeConfigDir(sourceEnv, config.envAllowlist) : undefined;
+
+      let spawnResult: HarnessSpawnResult;
+      try {
+        spawnResult = await run(
+          { command, args },
+          {
+            projectRoot: config.projectRoot,
+            timeoutMs: call.timeoutMs,
+            envAllowlist: config.envAllowlist,
+            ...(config.sourceEnv !== undefined ? { sourceEnv: config.sourceEnv } : {}),
+            ...(configDir !== undefined ? { injectedEnv: { CLAUDE_CONFIG_DIR: configDir } } : {}),
+            // stream-json carries the whole agent transcript; we need two events
+            // from it. Filtering as it arrives keeps a long station's memory
+            // proportional to what we actually read, not to how much it did.
+            stdoutLineFilter: (line) => CLAUDE_KEPT_EVENT.test(line),
+            onStdoutLine: () => call.onProgress?.(),
+          },
+        );
+      } finally {
+        if (configDir !== undefined) removeRunScopedClaudeConfigDir(configDir);
+      }
 
       if (spawnResult.timedOut) {
+        // No usage to recover here (issue #26 AC5): claude-headless reports
+        // usage only in a terminal `result` event, and a call killed at the
+        // wall-clock bound never emits one — there is nothing in stdout for
+        // buildKnownUsage to read. The absent figure stays honestly unknown;
+        // it must never be fabricated as a zero.
         fail('invocation exceeded its timeout and was killed', 'harness-timeout');
       }
 
@@ -440,12 +596,18 @@ export function createClaudeHarnessAdapter(config: ClaudeHarnessAdapterConfig): 
         // one short wait before the card runs again.
         if (isRateLimited(payload, rateLimit, spawnResult.stderr)) {
           const resetAtMs = bindingResetAtMs(rateLimit);
+          // A rate limit does not refund tokens already spent (issue #26
+          // AC5) — when the payload carries a complete usage/cost figure,
+          // fold it into the throw so the executor bills it rather than
+          // recording a failed-and-therefore-free attempt.
+          const usage = buildKnownUsage(payload, rateLimit);
           fail(
             `provider rate limit: ${payload?.result ?? rateLimit?.status ?? 'no detail reported'}`,
             'harness-rate-limited',
             {
               ...(resetAtMs !== undefined ? { resetAtMs } : {}),
               ...(rateLimit !== undefined ? { rateLimit } : {}),
+              ...(usage !== undefined ? { usage } : {}),
             },
           );
         }
@@ -455,7 +617,15 @@ export function createClaudeHarnessAdapter(config: ClaudeHarnessAdapterConfig): 
           payload !== null
             ? `${payload.terminal_reason ?? 'unknown reason'}: ${payload.result ?? ''}`.trim()
             : spawnResult.stderr.slice(0, 500);
-        fail(`exited with code ${spawnResult.exitCode}: ${detail}`, 'harness-nonzero-exit');
+        // Same recovery as the rate-limit branch above: a crash after the
+        // provider already billed the call is not a free attempt (issue #26
+        // AC5).
+        const crashUsage = buildKnownUsage(payload, rateLimit);
+        fail(
+          `exited with code ${spawnResult.exitCode}: ${detail}`,
+          'harness-nonzero-exit',
+          crashUsage !== undefined ? { usage: crashUsage } : undefined,
+        );
       }
 
       if (payload === null) {
@@ -472,44 +642,19 @@ export function createClaudeHarnessAdapter(config: ClaudeHarnessAdapterConfig): 
         fail('response payload had a missing or non-numeric total_cost_usd');
       }
 
-      const usage = payload.usage;
-      // Still the TRUE TOTAL across all four classes: run and wave budgets fold
-      // this number, so it must not shrink to input+output when the breakdown
-      // below splits it out. (These four are disjoint in claude's schema —
-      // input_tokens is uncached input, not an inclusive total — so summing
-      // them double-counts nothing.)
-      const tokens =
-        (usage.input_tokens ?? 0) +
-        (usage.output_tokens ?? 0) +
-        (usage.cache_creation_input_tokens ?? 0) +
-        (usage.cache_read_input_tokens ?? 0);
-
-      // modelUsage names the models the provider actually billed, filling the
-      // journal's `model` column (empty on harness rows until now).
-      //
-      // TWO OR MORE entries is the NORMAL case, not the exception: Claude Code
-      // bills a haiku model for side tasks alongside the main model, so even a
-      // trivial call returns two. Requiring exactly one meant the column fell
-      // back to the station's requested model on essentially every row —
-      // delivering nothing #5 asked for. Attribute to the entry that consumed
-      // the most tokens instead: that is the model that did the work and drove
-      // the cost.
-      const billedModel = dominantModel(payload.modelUsage);
+      // A successful call with a missing/malformed usage object already
+      // `fail()`ed above — claude throws rather than reporting unknown, and
+      // that is deliberate (AC4). buildKnownUsage returning undefined here
+      // would therefore be unreachable, not a silent success; the two guard
+      // clauses above are what keep it that way.
+      const knownUsage = buildKnownUsage(payload, rateLimit);
+      if (knownUsage === undefined) {
+        fail('response payload had a missing or malformed usage object');
+      }
 
       return {
         outputs: [],
-        usage: {
-          tokens,
-          cost: payload.total_cost_usd,
-          breakdown: {
-            inputTokens: usage.input_tokens ?? 0,
-            outputTokens: usage.output_tokens ?? 0,
-            cacheReadInputTokens: usage.cache_read_input_tokens ?? 0,
-            cacheCreationInputTokens: usage.cache_creation_input_tokens ?? 0,
-          },
-          ...(billedModel !== undefined ? { model: billedModel } : {}),
-          ...(rateLimit !== undefined ? { rateLimit } : {}),
-        },
+        usage: knownUsage,
       };
     },
   };

@@ -38,7 +38,7 @@ import { deriveSubflowRunId } from '../run/run-id';
 import type { StartWorkMessage } from '../worker/ipc-protocol';
 import { sanitizeStderrTail } from '../worker/ipc-protocol';
 import type { ModelAdapter } from '../worker/adapter';
-import { DEFAULT_RUN_ID, type ConduitDB, type JournalSpanInput } from '../persistence/db';
+import { DEFAULT_RUN_ID, type ConduitDB, type JournalSpanInput, type JournalProvenance } from '../persistence/db';
 import type { FlowConfig, StationConfig, FanInPolicyConfig, StationOutput, Card } from '../types/kernel';
 import { planTick } from './tick';
 import { attemptClaim, beginWork, renewLease, reconcile } from '../dispatch/claim';
@@ -47,6 +47,7 @@ import { runTransformStation, coerciveParse, computeFindingsHash } from '../work
 import type {
   HarnessRegistry, MountedInput, HarnessResult, KnownUsage, RateLimitSnapshot,
 } from '../worker/harness-adapter';
+import { usageFromThrow, resolveHarnessAgent } from '../worker/harness-adapter';
 import { harnessRetryDelayMs } from '../worker/harness-retry';
 import { loadImageInput, hashImageInputs, assertImagePayloadWithinLimits } from '../worker/image-input';
 import type { ImageInput } from '../worker/image-input';
@@ -56,6 +57,7 @@ import { runGateRework } from './gate-rework';
 import {
   computeBindingStamp,
   computeSkillAwarePromptTemplateVersion,
+  computeAgentAwarePromptTemplateVersion,
   writeCheckpoint,
   readCheckpoint,
   invalidateCheckpoint,
@@ -1593,6 +1595,11 @@ async function executeStation(args: ExecuteStationArgs): Promise<boolean> {
       harnessRegistry,
       // the pre-public deterministic failure-reporting review: fresh liveness stamp for slow-failing commands mid-retry.
       stampActivity: stampHarnessActivity,
+      // issue #26 AC3: a gate critic's billed spend must reach the SAME
+      // run/wave accumulators the harness/subflow maker paths already fold
+      // into — a deterministic maker itself never calls foldHarnessUsage, but
+      // its `check.critic.harness` critic can.
+      foldHarnessUsage,
       err,
     });
   }
@@ -1620,6 +1627,8 @@ async function executeStation(args: ExecuteStationArgs): Promise<boolean> {
       // Review #1: a transform maker may declare an AGENTIC critic
       // (check.critic.harness) — the registry must reach runGateCheckOrAdvance.
       harnessRegistry,
+      // issue #26 AC3: same reasoning as the deterministic branch above.
+      foldHarnessUsage,
       err,
     });
   }
@@ -1738,6 +1747,13 @@ interface DeterministicArgs {
    * wall-clock counts as progress during count-and-retry (the pre-public deterministic failure-reporting review).
    */
   stampActivity?: () => void;
+  /**
+   * issue #26 AC3: threaded through so a `check.critic.harness` (AGENTIC)
+   * critic gating this deterministic maker can fold its OWN billed spend into
+   * the same run/wave accumulators the maker path feeds — a deterministic
+   * command never calls a harness/model itself, but its gate critic can.
+   */
+  foldHarnessUsage: (tokens: number) => void;
   /** Error-surfacing channel threaded through from runExecutor's io.err. */
   err: (msg: string) => void;
 }
@@ -2043,7 +2059,7 @@ async function executeDeterministicStation(args: DeterministicArgs): Promise<boo
   const {
     db, stateDb, runId, stationConfig, stationId, cardId, commandAllowlist, happyPathNext, terminalLanes,
     projectRoot, flow, maxExecutionAttempts, trackingAdapter, currentNow, runStartedAt, wallClockSeconds,
-    maxTokens, getTokensSpent, onAndonTrip, harnessRegistry, stampActivity, err,
+    maxTokens, getTokensSpent, onAndonTrip, harnessRegistry, stampActivity, foldHarnessUsage, err,
   } = args;
 
   // Punch-list #8 — per-station wall-clock timeout for the spawned command.
@@ -2104,7 +2120,7 @@ async function executeDeterministicStation(args: DeterministicArgs): Promise<boo
         db, stateDb, runId, stationConfig, stationId, cardId, card,
         stationOutput: readDeterministicStationOutput(stationConfig, projectRoot),
         trackingAdapter, projectRoot, flow, happyPathNext, terminalLanes, maxExecutionAttempts,
-        currentNow, runStartedAt, wallClockSeconds, maxTokens, getTokensSpent, onAndonTrip, harnessRegistry, err,
+        currentNow, runStartedAt, wallClockSeconds, maxTokens, getTokensSpent, onAndonTrip, harnessRegistry, foldHarnessUsage, err,
       });
     }
 
@@ -2161,7 +2177,7 @@ async function executeDeterministicStation(args: DeterministicArgs): Promise<boo
         db, stateDb, runId, stationConfig, stationId, cardId, card,
         stationOutput: readDeterministicStationOutput(stationConfig, projectRoot),
         trackingAdapter, projectRoot, flow, happyPathNext, terminalLanes, maxExecutionAttempts,
-        currentNow, runStartedAt, wallClockSeconds, maxTokens, getTokensSpent, onAndonTrip, harnessRegistry, err,
+        currentNow, runStartedAt, wallClockSeconds, maxTokens, getTokensSpent, onAndonTrip, harnessRegistry, foldHarnessUsage, err,
       });
     } else {
       // Command failed with the intent still PENDING. A nonzero exit does NOT
@@ -2222,7 +2238,7 @@ async function executeDeterministicStation(args: DeterministicArgs): Promise<boo
       db, stateDb, runId, stationConfig, stationId, cardId, card,
       stationOutput: readDeterministicStationOutput(stationConfig, projectRoot),
       trackingAdapter, projectRoot, flow, happyPathNext, terminalLanes, maxExecutionAttempts,
-      currentNow, runStartedAt, wallClockSeconds, maxTokens, getTokensSpent, onAndonTrip, harnessRegistry, err,
+      currentNow, runStartedAt, wallClockSeconds, maxTokens, getTokensSpent, onAndonTrip, harnessRegistry, foldHarnessUsage, err,
     });
   } else {
     // Command failed → count it toward the attempt cap: retry below the cap,
@@ -2286,6 +2302,15 @@ interface GateCheckOrAdvanceArgs {
    * Optional — undefined for flows with no harness makers or critics.
    */
   harnessRegistry?: HarnessRegistry;
+  /**
+   * issue #26 AC3: folds a harness CRITIC's own billed spend into the SAME
+   * run/wave budget accumulators trackingAdapter/foldHarnessUsage already feed
+   * for the maker path — a gate critic never calls trackingAdapter (the maker
+   * kinds that host `check:` may not even touch a ModelAdapter at all, e.g. a
+   * deterministic maker), so without this the critic's own spend is invisible
+   * to the consumption andon and the wave budget.
+   */
+  foldHarnessUsage: (tokens: number) => void;
   err: (msg: string) => void;
 }
 
@@ -2703,7 +2728,7 @@ async function runGateCheckOrAdvance(args: GateCheckOrAdvanceArgs): Promise<bool
   const {
     db, stateDb, runId, stationConfig, stationId, cardId, card, stationOutput, trackingAdapter, projectRoot,
     flow, happyPathNext, terminalLanes, maxExecutionAttempts, currentNow, runStartedAt, wallClockSeconds,
-    maxTokens, getTokensSpent, onAndonTrip, harnessRegistry, err,
+    maxTokens, getTokensSpent, onAndonTrip, harnessRegistry, foldHarnessUsage, err,
   } = args;
 
   // ── Run gate check (if configured) ───────────────────────────────────────
@@ -2749,6 +2774,49 @@ async function runGateCheckOrAdvance(args: GateCheckOrAdvanceArgs): Promise<bool
         err, runId, true,
       );
       return false;
+    }
+
+    // ── issue #26 AC3/AC5: fold + journal the critic's OWN billed spend ──────
+    // Only an AGENTIC (harness) critic populates `criticUsage` — a transform
+    // critic's spend is already folded via trackingAdapter inside
+    // runTransformStation, and double-folding it here would double-count
+    // (see CriticUsage's doc comment in quality/gate.ts).
+    //
+    // PLACEMENT: this runs BEFORE the andon check below on purpose. A critic
+    // that itself blows the run budget must trip the andon on its own spend,
+    // not a tick later — folding first is what makes that true; checking the
+    // andon first would let one over-budget critic call slip through free.
+    if (gateDecision.criticUsage !== undefined) {
+      const { adapterName, model, durationMs, usage } = gateDecision.criticUsage;
+      const usageKnown = !('unknown' in usage);
+      if (usageKnown) {
+        // Budgets fold the TOTAL, mirroring the maker path's foldHarnessUsage
+        // call — never the pieces of a breakdown.
+        foldHarnessUsage(usage.tokens);
+      }
+      // SPAN NAME: '<station>.harness-critic', deliberately NOT '<station>.harness'.
+      // countConsecutiveRateLimitParks (~line 4469) walks journal spans
+      // backwards by the EXACT name '<station>.harness' to bound
+      // MAX_CONSECUTIVE_RATE_LIMIT_PARKS; a critic span sharing that name
+      // would silently corrupt that streak (either hard-pausing a maker that
+      // never actually parked, or masking one that did).
+      db.appendJournalSpan({
+        runId,
+        cardId,
+        station: stationId,
+        attempt: card.attempt,
+        name: `${stationId}.harness-critic`,
+        // Provenance: the critic's agent and its definition hash. The critic
+        // writes no checkpoint, so it has no binding stamp to record.
+        ...(gateDecision.criticUsage.agent !== undefined
+          ? { agent: gateDecision.criticUsage.agent, agentSha256: gateDecision.criticUsage.agentSha256 }
+          : {}),
+        adapter: adapterName,
+        durationMs,
+        usageUnknown: !usageKnown,
+        usage: usageKnown ? harnessJournalUsage(usage, model) : undefined,
+        attributes: usageKnown ? rateLimitAttributes(usage.rateLimit) : {},
+      });
     }
 
     // Andon check after gate model call.
@@ -2968,6 +3036,13 @@ interface TransformArgs {
    * every maker kind must supply the registry, not just a harness maker.
    */
   harnessRegistry?: HarnessRegistry;
+  /**
+   * issue #26 AC3: threaded through so a `check.critic.harness` (AGENTIC)
+   * critic gating this transform maker can fold its OWN billed spend into the
+   * same run/wave accumulators the maker path feeds — a transform maker's own
+   * model call already folds via trackingAdapter, but a harness critic does not.
+   */
+  foldHarnessUsage: (tokens: number) => void;
   /** Error-surfacing channel threaded through from runExecutor's io.err. */
   err: (msg: string) => void;
 }
@@ -2993,6 +3068,7 @@ async function executeTransformStation(args: TransformArgs): Promise<boolean> {
     getTokensSpent,
     onAndonTrip,
     harnessRegistry,
+    foldHarnessUsage,
     err,
   } = args;
 
@@ -3203,6 +3279,8 @@ async function executeTransformStation(args: TransformArgs): Promise<boolean> {
       // engine-default timeout (not truly unbounded — the original transform-timeout work).
       timeoutMs:
         stationConfig.timeout_seconds !== undefined ? stationConfig.timeout_seconds * 1000 : undefined,
+      // Journal provenance: the stamp and the effective prompt version it folded.
+      provenance: { bindingStamp, promptTemplateVersion },
     });
 
     // ── Andon check after model call ──────────────────────────────────────────
@@ -3378,7 +3456,7 @@ async function executeTransformStation(args: TransformArgs): Promise<boolean> {
     db, stateDb, runId, stationConfig, stationId, cardId, card,
     stationOutput,
     trackingAdapter, projectRoot, flow, happyPathNext, terminalLanes, maxExecutionAttempts,
-    currentNow, runStartedAt, wallClockSeconds, maxTokens, getTokensSpent, onAndonTrip, harnessRegistry, err,
+    currentNow, runStartedAt, wallClockSeconds, maxTokens, getTokensSpent, onAndonTrip, harnessRegistry, foldHarnessUsage, err,
   });
 }
 
@@ -3494,6 +3572,32 @@ async function executeHarnessStation(args: HarnessArgs): Promise<boolean> {
   // let a changed adapter default wrongly skip on resume).
   const effectiveModel = stationConfig.model ?? harnessAdapter.model;
 
+  // ── Effective agent (issue #28): same precedence as the model, computed
+  // once so the stamp and the invocation agree. The definition file is
+  // resolved HERE, at dispatch, not only at load: plugin dirs are engine
+  // config, and the file may have changed since the flow loaded. An agent that
+  // cannot be resolved is a configuration failure, so the card holds rather
+  // than stamping on the name alone, which would let an edited agent replay
+  // from a stale checkpoint.
+  const effectiveAgent = stationConfig.agent ?? harnessAdapter.agent;
+  let promptTemplateVersion = stationConfig.prompt_version ?? '';
+  let agentSha256: string | undefined;
+  if (effectiveAgent !== undefined) {
+    const definition = resolveHarnessAgent(harnessAdapter, effectiveAgent);
+    if (!definition.ok) {
+      escalateToHold(
+        stateDb, db, cardId, stationId, card,
+        `harness agent unresolved for station '${stationId}': ${definition.error}`,
+        err, runId, true,
+      );
+      return false;
+    }
+    agentSha256 = definition.sha256;
+    promptTemplateVersion = computeAgentAwarePromptTemplateVersion(
+      promptTemplateVersion, effectiveAgent, definition.sha256,
+    );
+  }
+
   // ── Accumulate prior gate rejection findings for feedback (FR-5) ──────────
   // Identical to the transform path: {{feedback}} is prompt-threaded, zero new
   // machinery (WI-565 AC2).
@@ -3531,7 +3635,8 @@ async function executeHarnessStation(args: HarnessArgs): Promise<boolean> {
 
   const bindingStamp = computeBindingStamp({
     modelId: effectiveModel ?? '',
-    promptTemplateVersion: stationConfig.prompt_version ?? '',
+    // prompt_version, with the effective agent folded in when there is one.
+    promptTemplateVersion,
     inputArtifactHashes: inputHashes,
     flowVersion: flow.version,
     // WI-572 / review #7: the adapter's identity rides the dedicated
@@ -3541,6 +3646,14 @@ async function executeHarnessStation(args: HarnessArgs): Promise<boolean> {
     // modelId stays semantically the model id.
     adapterName: harnessAdapter.name,
   });
+
+  // Journal provenance, written on every `<station>.harness` span below so each
+  // result is attributable to the exact config that produced it across runs.
+  const provenance: JournalProvenance = {
+    bindingStamp,
+    promptTemplateVersion,
+    ...(effectiveAgent !== undefined ? { agent: effectiveAgent, agentSha256 } : {}),
+  };
 
   // ── WI-571: effectful-station outbox discipline (Phase 3, FR-11) ────────
   // Mirrors the transform effectful path exactly (SPEC §5 exactly-once): for
@@ -3675,6 +3788,7 @@ async function executeHarnessStation(args: HarnessArgs): Promise<boolean> {
           timeoutMs,
           model: effectiveModel,
           onProgress: stampHarnessActivity,
+          ...(effectiveAgent !== undefined ? { agent: effectiveAgent } : {}),
         });
       } catch (invokeErr) {
         // WI-567 FR-8 fix: stamp fresh liveness progress even on a thrown
@@ -3697,9 +3811,26 @@ async function executeHarnessStation(args: HarnessArgs): Promise<boolean> {
         if ((invokeErr as { code?: string }).code === 'harness-rate-limited') {
           const resetAtMs = (invokeErr as { resetAtMs?: number }).resetAtMs;
           const releaseAt = releaseAtForRateLimit(currentNow, resetAtMs, Date.now());
+          // issue #26 AC5: a rate limit does not refund tokens already spent —
+          // a call that ran for minutes before hitting the cap was still
+          // billed. Recovered the SAME way as the general-throw catch below
+          // (usageFromThrow), and folded/journaled BEFORE the park so the
+          // run/wave budget sees it even though this attempt spends no
+          // execution attempt. Safe to fold here: `attributes.outcome` stays
+          // 'harness-rate-limited' regardless, so countConsecutiveRateLimitParks
+          // (which keys on that attribute, not usageUnknown) is unaffected.
+          const parkedUsage = usageFromThrow(invokeErr);
+          let parkedUsageKnown = false;
+          let parkedJournalUsage: JournalSpanInput['usage'];
+          if (parkedUsage !== undefined && !('unknown' in parkedUsage)) {
+            parkedUsageKnown = true;
+            foldHarnessUsage(parkedUsage.tokens);
+            parkedJournalUsage = harnessJournalUsage(parkedUsage, effectiveModel);
+          }
           db.appendJournalSpan({
-            runId, cardId, station: stationId, attempt: attemptIndex, name: `${stationId}.harness`,
-            adapter: harnessAdapter.name, durationMs: Date.now() - invokeStartedAt, usageUnknown: true,
+            runId, cardId, station: stationId, attempt: attemptIndex, name: `${stationId}.harness`, ...provenance,
+            adapter: harnessAdapter.name, durationMs: Date.now() - invokeStartedAt,
+            usageUnknown: !parkedUsageKnown, usage: parkedJournalUsage,
             attributes: {
               // Issue #5 ask (4): a usage_unknown row that names WHY. This is
               // what separates "capped, cost nothing" from "ran for minutes and
@@ -3768,12 +3899,29 @@ async function executeHarnessStation(args: HarnessArgs): Promise<boolean> {
             : code === 'harness-nonzero-exit'
               ? 'harness-nonzero-exit'
               : `harness-invocation-failed: ${(invokeErr as Error).message}`;
-        // WI-567 AC2: on the books even when the invocation itself throws — no
-        // usage was ever returned, so this is explicitly unknown (never a
-        // fabricated zero) and does NOT fold into the run/wave budget.
+        // issue #26 AC5: a thrown invocation was still BILLED for whatever it
+        // did before it died (a timeout or nonzero exit does not refund
+        // tokens already consumed). usageFromThrow is the ONE reader for
+        // usage attached to a harness throw — never cast and reach for
+        // `.usage` directly. When the adapter recovered a real figure, fold
+        // it into the run/wave budget and journal it instead of a fabricated
+        // usageUnknown row; when it returns undefined (the adapter genuinely
+        // could not recover one — e.g. a claude wall-clock timeout, which
+        // never emits a terminal result event to read usage from), this is
+        // WI-567 AC2's original behaviour, unchanged: explicitly unknown,
+        // never a fabricated zero, and nothing folds into the budget.
+        const thrownUsage = usageFromThrow(invokeErr);
+        let thrownUsageKnown = false;
+        let thrownJournalUsage: JournalSpanInput['usage'];
+        if (thrownUsage !== undefined && !('unknown' in thrownUsage)) {
+          thrownUsageKnown = true;
+          foldHarnessUsage(thrownUsage.tokens);
+          thrownJournalUsage = harnessJournalUsage(thrownUsage, effectiveModel);
+        }
         db.appendJournalSpan({
-          runId, cardId, station: stationId, attempt: attemptIndex, name: `${stationId}.harness`,
-          adapter: harnessAdapter.name, durationMs: Date.now() - invokeStartedAt, usageUnknown: true,
+          runId, cardId, station: stationId, attempt: attemptIndex, name: `${stationId}.harness`, ...provenance,
+          adapter: harnessAdapter.name, durationMs: Date.now() - invokeStartedAt,
+          usageUnknown: !thrownUsageKnown, usage: thrownJournalUsage,
           attributes: { outcome: scrapReason },
         });
         // Issue #3: back off before the next attempt. Without this,
@@ -3853,7 +4001,7 @@ async function executeHarnessStation(args: HarnessArgs): Promise<boolean> {
           : runOwnedPathsIntegrity(projectRoot, ownedPaths, touchedPaths);
       if (integrityViolation && !integrityViolation.ok) {
         db.appendJournalSpan({
-          runId, cardId, station: stationId, attempt: attemptIndex, name: `${stationId}.harness`,
+          runId, cardId, station: stationId, attempt: attemptIndex, name: `${stationId}.harness`, ...provenance,
           adapter: harnessAdapter.name, durationMs, usageUnknown: !usageKnown, usage: journalUsage,
           attributes: { outcome: `integrity_violation: ${describeIntegrity(integrityViolation)}` },
         });
@@ -3873,7 +4021,7 @@ async function executeHarnessStation(args: HarnessArgs): Promise<boolean> {
         callsMade++;
         scrapReason = `harness-output-missing: ${missingOutputs.join(', ')}`;
         db.appendJournalSpan({
-          runId, cardId, station: stationId, attempt: attemptIndex, name: `${stationId}.harness`,
+          runId, cardId, station: stationId, attempt: attemptIndex, name: `${stationId}.harness`, ...provenance,
           adapter: harnessAdapter.name, durationMs, usageUnknown: !usageKnown, usage: journalUsage,
           attributes: { outcome: scrapReason },
         });
@@ -3895,7 +4043,7 @@ async function executeHarnessStation(args: HarnessArgs): Promise<boolean> {
         callsMade++;
         scrapReason = `harness-output-unparseable: station '${stationId}' output '${outputFile ?? '(none declared)'}' is not valid JSON`;
         db.appendJournalSpan({
-          runId, cardId, station: stationId, attempt: attemptIndex, name: `${stationId}.harness`,
+          runId, cardId, station: stationId, attempt: attemptIndex, name: `${stationId}.harness`, ...provenance,
           adapter: harnessAdapter.name, durationMs, usageUnknown: !usageKnown, usage: journalUsage,
           attributes: { outcome: scrapReason },
         });
@@ -3906,7 +4054,7 @@ async function executeHarnessStation(args: HarnessArgs): Promise<boolean> {
         callsMade++;
         scrapReason = `harness-output-invalid: station '${stationId}': ${validated.error}`;
         db.appendJournalSpan({
-          runId, cardId, station: stationId, attempt: attemptIndex, name: `${stationId}.harness`,
+          runId, cardId, station: stationId, attempt: attemptIndex, name: `${stationId}.harness`, ...provenance,
           adapter: harnessAdapter.name, durationMs, usageUnknown: !usageKnown, usage: journalUsage,
           attributes: { outcome: scrapReason },
         });
@@ -3943,7 +4091,7 @@ async function executeHarnessStation(args: HarnessArgs): Promise<boolean> {
         }
       }
       db.appendJournalSpan({
-        runId, cardId, station: stationId, attempt: attemptIndex, name: `${stationId}.harness`,
+        runId, cardId, station: stationId, attempt: attemptIndex, name: `${stationId}.harness`, ...provenance,
         adapter: harnessAdapter.name, durationMs, usageUnknown: !usageKnown, usage: journalUsage,
         // Issue #5: the capacity snapshot rides along on the priced row, so
         // "what did this run draw against the plan" is a query rather than an
@@ -4014,7 +4162,7 @@ async function executeHarnessStation(args: HarnessArgs): Promise<boolean> {
     stationOutput,
     trackingAdapter, projectRoot, flow, happyPathNext, terminalLanes, maxExecutionAttempts,
     currentNow, runStartedAt, wallClockSeconds, maxTokens, getTokensSpent, onAndonTrip,
-    harnessRegistry, err,
+    harnessRegistry, foldHarnessUsage, err,
   });
 }
 
@@ -4199,11 +4347,14 @@ async function executeSubflowStation(args: SubflowArgs): Promise<boolean> {
         ? { model: '', inputTokens: result.tokens ?? 0, outputTokens: 0, costUsd: result.costUsd ?? 0 }
         : undefined;
 
+      // Subflow spans record only bindingStamp as provenance: a subflow
+      // station has no prompt, so its stamp is computed with an empty
+      // promptTemplateVersion and no agent, and there is nothing else to record.
       if (result.outcome !== 'done') {
         callsMade++;
         scrapReason = `subflow-${result.outcome}: ${result.reason}`;
         db.appendJournalSpan({
-          runId, cardId, station: stationId, attempt: attemptIndex, name: `${stationId}.subflow`,
+          runId, cardId, station: stationId, attempt: attemptIndex, name: `${stationId}.subflow`, bindingStamp,
           adapter: `subflow:${childFlowPath}`, durationMs, usageUnknown: !usageKnown, usage: journalUsage,
           attributes: { child_run_id: childRunId, outcome: scrapReason },
         });
@@ -4218,7 +4369,7 @@ async function executeSubflowStation(args: SubflowArgs): Promise<boolean> {
         callsMade++;
         scrapReason = `subflow-output-missing: ${missingOutputs.join(', ')}`;
         db.appendJournalSpan({
-          runId, cardId, station: stationId, attempt: attemptIndex, name: `${stationId}.subflow`,
+          runId, cardId, station: stationId, attempt: attemptIndex, name: `${stationId}.subflow`, bindingStamp,
           adapter: `subflow:${childFlowPath}`, durationMs, usageUnknown: !usageKnown, usage: journalUsage,
           attributes: { child_run_id: childRunId, outcome: scrapReason },
         });
@@ -4236,7 +4387,7 @@ async function executeSubflowStation(args: SubflowArgs): Promise<boolean> {
       stationOutput = output;
 
       db.appendJournalSpan({
-        runId, cardId, station: stationId, attempt: attemptIndex, name: `${stationId}.subflow`,
+        runId, cardId, station: stationId, attempt: attemptIndex, name: `${stationId}.subflow`, bindingStamp,
         adapter: `subflow:${childFlowPath}`, durationMs, usageUnknown: !usageKnown, usage: journalUsage,
         attributes: { child_run_id: childRunId, outcome: 'success' },
       });
@@ -4274,7 +4425,7 @@ async function executeSubflowStation(args: SubflowArgs): Promise<boolean> {
     stationOutput,
     trackingAdapter, projectRoot, flow, happyPathNext, terminalLanes, maxExecutionAttempts,
     currentNow, runStartedAt, wallClockSeconds, maxTokens, getTokensSpent, onAndonTrip,
-    harnessRegistry, err,
+    harnessRegistry, foldHarnessUsage, err,
   });
 }
 

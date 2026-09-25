@@ -220,6 +220,14 @@ export interface StationConfig {
    */
   harness?: string;
   /**
+   * Named agent for a `kind: harness` station (issue #28), e.g. `team:coder`,
+   * from `worker.agent`. Absent when undeclared: the executor uses
+   * `agent ?? adapter default`, threads it to HarnessInvocation.agent, and
+   * folds its name and definition-file hash into the binding stamp's
+   * promptTemplateVersion (computeAgentAwarePromptTemplateVersion).
+   */
+  agent?: string;
+  /**
    * Absolute path to the child flow.yaml for a `kind: subflow` station
    * (the original multi-flow engine work, flow-as-station composition) — required for subflow stations,
    * absent otherwise. Resolved at load time relative to the parent flow's
@@ -341,10 +349,18 @@ export interface StationGateConfig {
   criticInputScope: string[];
   /**
    * Adapter name for an AGENTIC critic (WI-570, Phase 2) — a `kind: harness`
-   * station used as the critic gate instead of a model call. Mutually
-   * exclusive in practice with a meaningful `criticModel` (absent when a
-   * harness critic is configured). Resolved against the same engine-config
-   * harness registry a `kind: harness` maker uses (WI-560).
+   * station used as the critic gate instead of a model call. Resolved against
+   * the same engine-config harness registry a `kind: harness` maker uses
+   * (WI-560).
+   *
+   * NOT mutually exclusive with `criticModel`, despite what this comment used
+   * to claim. Issue #26 AC4 made a harness critic's model meaningful:
+   * `check.critic.model` now reaches `HarnessInvocation.model` with
+   * station-over-adapter precedence (FR-10), so declaring both is the
+   * SUPPORTED way to pin a critic to a specific model while the adapter
+   * supplies the deployment default elsewhere. Note that an absent critic
+   * model is the EMPTY STRING, not undefined (flow/load.ts), so any
+   * precedence check must treat `''` as absent.
    */
   criticHarness?: string;
   /**
@@ -359,6 +375,12 @@ export interface StationGateConfig {
    * cannot host a critic at all).
    */
   criticTools?: string[];
+  /**
+   * Named agent for an agentic (harness) critic (issue #28), from
+   * `check.critic.agent`. Absent when undeclared, never `''` (unlike
+   * `criticModel`); the gate uses `criticAgent ?? adapter default`.
+   */
+  criticAgent?: string;
   /**
    * Wall-clock bound for an agentic (harness) critic's invocation, in ms
    * (check.critic.timeout_seconds * 1000). Absent -> the engine default
@@ -494,11 +516,28 @@ export interface StationOutput<TPayload> {
    * Consumed by the gate (WI-300) to route the card.
    */
   return_to: Lane | null;
-  /** Per-call token and cost attribution for budget tracking. */
-  usage: {
-    tokens: number;
-    cost: number;
-  };
+  /**
+   * Per-call token and cost attribution for budget tracking.
+   *
+   * A UNION, not a bare `{tokens, cost}`, because a MISSING measurement and a
+   * MEASURED zero are different facts and must stay distinguishable (issue
+   * #26 AC2). An adapter that cannot report usage for a call returns
+   * `{ unknown: true }` (HarnessResult.usage, worker/harness-adapter.ts) and
+   * that unknown must survive into the StationOutput rather than being
+   * flattened to a fabricated `{ tokens: 0, cost: 0 }` — a fabricated zero is
+   * indistinguishable from a free call and silently under-counts every budget
+   * that folds this number.
+   *
+   * Structurally compatible with `UsageReport` from worker/harness-adapter.ts,
+   * deliberately restated here rather than imported: types/kernel.ts is the
+   * kernel's dependency-free type root and must not take an edge into worker/.
+   */
+  usage:
+    | {
+        tokens: number;
+        cost: number;
+      }
+    | { unknown: true };
 }
 
 // ---------------------------------------------------------------------------

@@ -43,4 +43,4 @@ sig = "ec86cf6e6cd93960"
 [[bindings]]
 doc = "docs/installation.md"
 target = "src/cli/main.ts"
-sig = "42fa70f38ede62f5"
+sig = "e92e047319792114"

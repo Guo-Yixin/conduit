@@ -66,8 +66,9 @@ import type {
   HarnessRunnerConfig,
   HarnessSpawnResult,
 } from './harness-runner';
-import { createHarnessRegistry } from './harness-adapter';
+import { createHarnessRegistry, usageFromThrow } from './harness-adapter';
 import type { HarnessAdapter, HarnessInvocation, BinaryProbe } from './harness-adapter';
+import { describeHarnessContainmentConformance } from './harness-containment.conformance';
 
 // ---------------------------------------------------------------------------
 // Recorded `codex exec --json` event streams (JSONL, no live network).
@@ -498,6 +499,82 @@ describe('codex-exec adapter: named spawn failures', () => {
 });
 
 // ---------------------------------------------------------------------------
+// Issue #26 AC5 — a throw that was still BILLED carries the real usage figure.
+// Unlike claude (a single terminal result event), codex's usage lives in
+// PER-TURN turn.completed events streamed as the run proceeds, so a kill or a
+// crash after several completed turns still has real per-turn usage sitting in
+// the captured stdout.
+// ---------------------------------------------------------------------------
+
+describe('codex-exec adapter: usage carried through a billed throw (issue #26 AC5)', () => {
+  it('a timed-out run whose stdout carried two turn.completed events carries the SUMMED usage', async () => {
+    const stdout = [
+      JSON.stringify({ type: 'thread.started' }),
+      JSON.stringify({ type: 'turn.completed', usage: { input_tokens: 100, cached_input_tokens: 10, output_tokens: 40, reasoning_output_tokens: 20 } }),
+      JSON.stringify({ type: 'item.completed', item: { type: 'agent_message', text: 'more work' } }),
+      JSON.stringify({ type: 'turn.completed', usage: { input_tokens: 300, cached_input_tokens: 30, output_tokens: 60, reasoning_output_tokens: 15 } }),
+    ].join('\n');
+    const adapter = makeAdapter({ run: makeRun({ stdout, timedOut: true, exitCode: 137 }).run });
+
+    const err = await adapter.invoke(invocation()).catch((e: unknown) => e);
+
+    expect((err as { code?: string }).code).toBe('harness-timeout');
+    // A kill does not refund the tokens the two completed turns already spent.
+    // input (100+300) + output (40+60) + reasoning (20+15) = 535.
+    expect(usageFromThrow(err)).toEqual({
+      tokens: 535,
+      cost: 0,
+      breakdown: {
+        inputTokens: 360, outputTokens: 135,
+        cacheReadInputTokens: 40, cacheCreationInputTokens: 0,
+      },
+    });
+  });
+
+  it('a non-zero exit with partial turn usage carries it', async () => {
+    const stdout = [
+      JSON.stringify({ type: 'thread.started' }),
+      JSON.stringify({
+        type: 'turn.completed',
+        usage: { input_tokens: 800, cached_input_tokens: 64, output_tokens: 200, reasoning_output_tokens: 50 },
+      }),
+    ].join('\n');
+    const adapter = makeAdapter({ run: makeRun({ stdout, exitCode: 1, stderr: 'boom' }).run });
+
+    const err = await adapter.invoke(invocation()).catch((e: unknown) => e);
+
+    expect((err as { code?: string }).code).toBe('harness-nonzero-exit');
+    expect(usageFromThrow(err)).toEqual({
+      tokens: 1050,
+      cost: 0,
+      breakdown: {
+        inputTokens: 736, outputTokens: 250,
+        cacheReadInputTokens: 64, cacheCreationInputTokens: 0,
+      },
+    });
+  });
+
+  it('a timed-out run with no parseable usage event carries no usage — absent, not zero', async () => {
+    const adapter = makeAdapter({
+      run: makeRun({ stdout: RECORDED_SUCCESS_NO_USAGE, timedOut: true, exitCode: 137 }).run,
+    });
+
+    const err = await adapter.invoke(invocation()).catch((e: unknown) => e);
+
+    expect((err as { code?: string }).code).toBe('harness-timeout');
+    expect(usageFromThrow(err)).toBeUndefined();
+  });
+
+  it('regression: a successful run with no usage event still returns { unknown: true }', async () => {
+    const adapter = makeAdapter({ run: makeRun({ stdout: RECORDED_SUCCESS_NO_USAGE }).run });
+
+    const result = await adapter.invoke(invocation());
+
+    expect(result.usage).toEqual({ unknown: true });
+  });
+});
+
+// ---------------------------------------------------------------------------
 // The config-only-swap seam: two adapters, resolved by NAME alone.
 // ---------------------------------------------------------------------------
 
@@ -520,3 +597,11 @@ describe('codex-exec adapter: config-only provider swap seam', () => {
     expect([...registry.list()].sort()).toEqual(['claude-headless', 'codex-exec']);
   });
 });
+
+// ---------------------------------------------------------------------------
+// Containment conformance (issue #27): the real runner, a real `sh` fixture as
+// the binary, and a grandchild that must die when the invocation times out.
+// ---------------------------------------------------------------------------
+
+describeHarnessContainmentConformance('codex-exec', (opts) =>
+  createCodexHarnessAdapter({ ...opts, envAllowlist: [] }));
